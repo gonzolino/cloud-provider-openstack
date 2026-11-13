@@ -23,7 +23,7 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/gophercloud/gophercloud"
+	"github.com/gophercloud/gophercloud/v2"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/klog/v2"
 
@@ -50,8 +50,8 @@ func findString(a string, list []string) bool {
 }
 
 // getAllowed gets the allowed resources based on the definition.
-func getAllowed(definition string, str string) (sets.String, error) {
-	allowed := sets.NewString()
+func getAllowed(definition string, str string) (sets.Set[string], error) {
+	allowed := sets.New[string]()
 
 	if definition == str || definition == "*" || str == "" {
 		allowed.Insert(str)
@@ -64,7 +64,7 @@ func getAllowed(definition string, str string) (sets.String, error) {
 	} else if strings.Index(definition, "[") == 0 && strings.Index(definition, "]") == (len(definition)-1) {
 		// "['namespace1', 'namespace2']"
 		var items []string
-		if err := json.Unmarshal([]byte(strings.Replace(definition, "'", "\"", -1)), &items); err != nil {
+		if err := json.Unmarshal([]byte(strings.ReplaceAll(definition, "'", "\"")), &items); err != nil {
 			klog.V(4).Infof("Skip the permission definition %s", definition)
 			return nil, fmt.Errorf("")
 		}
@@ -78,7 +78,7 @@ func getAllowed(definition string, str string) (sets.String, error) {
 	} else if strings.Index(definition, "!") == 0 && strings.Index(definition, "[") == 1 && strings.Index(definition, "]") == (len(definition)-1) {
 		// "!['namespace1', 'namespace2']"
 		var items []string
-		if err := json.Unmarshal([]byte(strings.Replace(definition[1:], "'", "\"", -1)), &items); err != nil {
+		if err := json.Unmarshal([]byte(strings.ReplaceAll(definition[1:], "'", "\"")), &items); err != nil {
 			klog.V(4).Infof("Skip the permission definition %s", definition)
 			return nil, fmt.Errorf("")
 		}
@@ -139,7 +139,7 @@ func resourcePermissionAllowed(permissionSpec map[string][]string, attr authoriz
 			continue
 		}
 
-		klog.V(4).Infof("allowedNamespaces: %s, allowedResources: %s, allowedVerbs: %s", allowedNamespaces.List(), allowedResources.List(), allowedVerbs.List())
+		klog.V(4).Infof("allowedNamespaces: %s, allowedResources: %s, allowedVerbs: %s", allowedNamespaces, allowedResources, allowedVerbs)
 
 		if allowedNamespaces.Has(ns) && allowedResources.Has(res) && allowedVerbs.Has(verb) {
 			return true
@@ -219,8 +219,8 @@ func nonResourceMatches(p policy, a authorizer.Attributes) bool {
 	}
 	if *p.NonResourceSpec.NonResourcePath != "*" && *p.NonResourceSpec.NonResourcePath != a.GetPath() &&
 		// Allow a trailing * subpath match
-		!(strings.HasSuffix(*p.NonResourceSpec.NonResourcePath, "*") &&
-			strings.HasPrefix(a.GetPath(), strings.TrimRight(*p.NonResourceSpec.NonResourcePath, "*"))) {
+		(!strings.HasSuffix(*p.NonResourceSpec.NonResourcePath, "*") ||
+			!strings.HasPrefix(a.GetPath(), strings.TrimRight(*p.NonResourceSpec.NonResourcePath, "*"))) {
 		return false
 	}
 	allowed := match(p.Match, a)
@@ -236,7 +236,7 @@ func nonResourceMatches(p policy, a authorizer.Attributes) bool {
 
 func match(match []policyMatch, attributes authorizer.Attributes) bool {
 	user := attributes.GetUser()
-	var find = false
+	var find bool
 	types := []string{TypeGroup, TypeProject, TypeRole, TypeUser}
 
 	for _, m := range match {
@@ -324,7 +324,7 @@ func (a *Authorizer) Authorize(attributes authorizer.Attributes) (authorized aut
 		}
 	}
 
-	// When the user.Extra does not exist, it means that the keytone user authentication has failed, and the authorization verification should not pass.
+	// When the user.Extra does not exist, it means that the keystone user authentication has failed, and the authorization verification should not pass.
 	if user.GetExtra() == nil {
 		return authorizer.DecisionDeny, "No auth info found.", nil
 	}

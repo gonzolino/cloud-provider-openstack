@@ -1,17 +1,24 @@
 package cinder
 
 import (
+	"context"
 	"fmt"
 	"strings"
+	"sync/atomic"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/kubernetes-csi/csi-lib-utils/protosanitizer"
-	"golang.org/x/net/context"
 	"google.golang.org/grpc"
+	"k8s.io/client-go/kubernetes"
 	"k8s.io/cloud-provider-openstack/pkg/csi/cinder/openstack"
+	"k8s.io/cloud-provider-openstack/pkg/util/brick"
 	"k8s.io/cloud-provider-openstack/pkg/util/metadata"
 	"k8s.io/cloud-provider-openstack/pkg/util/mount"
 	"k8s.io/klog/v2"
+)
+
+var (
+	serverGRPCEndpointCallCounter uint64
 )
 
 func NewControllerServiceCapability(cap csi.ControllerServiceCapability_RPC_Type) *csi.ControllerServiceCapability {
@@ -38,30 +45,42 @@ func NewVolumeCapabilityAccessMode(mode csi.VolumeCapability_AccessMode_Mode) *c
 	return &csi.VolumeCapability_AccessMode{Mode: mode}
 }
 
-func NewControllerServer(d *CinderDriver, cloud openstack.IOpenStack) *controllerServer {
+//revive:disable:unexported-return
+func NewControllerServer(d *Driver, clouds map[string]openstack.IOpenStack, connProps ConnectorPropertiesGetter) *controllerServer {
 	return &controllerServer{
-		Driver: d,
-		Cloud:  cloud,
+		Driver:    d,
+		Clouds:    clouds,
+		ConnProps: connProps,
 	}
 }
 
-func NewIdentityServer(d *CinderDriver) *identityServer {
+func NewIdentityServer(d *Driver) *identityServer {
 	return &identityServer{
 		Driver: d,
 	}
 }
 
-func NewNodeServer(d *CinderDriver, mount mount.IMount, metadata metadata.IMetadata, cloud openstack.IOpenStack) *nodeServer {
+func NewNodeServer(d *Driver, mount mount.IMount, metadata metadata.IMetadata, opts openstack.BlockStorageOpts, topologies map[string]string, connector brick.IConnector, kubeClient kubernetes.Interface, nodeName string, clouds map[string]openstack.IOpenStack) *nodeServer {
+	if opts.NodeVolumeAttachLimit < 0 || opts.NodeVolumeAttachLimit > maxVolumesPerNode {
+		opts.NodeVolumeAttachLimit = maxVolumesPerNode
+	}
+
 	return &nodeServer{
-		Driver:   d,
-		Mount:    mount,
-		Metadata: metadata,
-		Cloud:    cloud,
+		Driver:     d,
+		Mount:      mount,
+		Metadata:   metadata,
+		Brick:      connector,
+		Clouds:     clouds,
+		KubeClient: kubeClient,
+		NodeName:   nodeName,
+		Topologies: topologies,
+		Opts:       opts,
 	}
 }
 
-func RunControllerandNodePublishServer(endpoint string, ids csi.IdentityServer, cs csi.ControllerServer, ns csi.NodeServer) {
+//revive:enable:unexported-return
 
+func RunServicesInitialized(endpoint string, ids csi.IdentityServer, cs csi.ControllerServer, ns csi.NodeServer) {
 	s := NewNonBlockingGRPCServer()
 	s.Start(endpoint, ids, cs, ns)
 	s.Wait()
@@ -74,17 +93,36 @@ func ParseEndpoint(ep string) (string, string, error) {
 			return s[0], s[1], nil
 		}
 	}
-	return "", "", fmt.Errorf("Invalid endpoint: %v", ep)
+	return "", "", fmt.Errorf("invalid endpoint: %v", ep)
 }
 
 func logGRPC(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
-	klog.V(3).Infof("GRPC call: %s", info.FullMethod)
-	klog.V(5).Infof("GRPC request: %+v", protosanitizer.StripSecrets(req))
+	callID := atomic.AddUint64(&serverGRPCEndpointCallCounter, 1)
+
+	klog.V(3).Infof("[ID:%d] GRPC call: %s", callID, info.FullMethod)
+	klog.V(5).Infof("[ID:%d] GRPC request: %s", callID, protosanitizer.StripSecrets(req))
 	resp, err := handler(ctx, req)
 	if err != nil {
-		klog.Errorf("GRPC error: %v", err)
+		klog.Errorf("[ID:%d] GRPC error: %v", callID, err)
 	} else {
-		klog.V(5).Infof("GRPC response: %+v", protosanitizer.StripSecrets(resp))
+		klog.V(5).Infof("[ID:%d] GRPC response: %s", callID, protosanitizer.StripSecrets(resp))
 	}
+
 	return resp, err
+}
+
+func splitToken(str string) (string, string) {
+	i := strings.Index(str, ":")
+	if i == -1 {
+		return str, ""
+	}
+
+	return str[:i], str[i+1:]
+}
+
+func joinToken(str1, str2 string) string {
+	if str2 == "" {
+		return str1
+	}
+	return str1 + ":" + str2
 }

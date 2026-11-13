@@ -1,3 +1,4 @@
+//go:build !linux
 // +build !linux
 
 /*
@@ -32,4 +33,8 @@ func GetBlockDeviceSize(path string) (int64, error) {
 
 func RescanBlockDeviceGeometry(devicePath string, deviceMountPath string, newSize int64) error {
 	return errors.New("RescanBlockDeviceGeometry is not implemented for this OS")
+}
+
+func RescanDevice(devicePath string) error {
+	return errors.New("RescanDevice is not implemented for this OS")
 }

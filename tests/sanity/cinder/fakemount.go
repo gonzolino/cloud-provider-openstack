@@ -18,7 +18,7 @@ var (
 	mounter     = &cpomount.Mount{BaseMounter: newFakeSafeFormatAndMounter()}
 )
 
-//GetFakeMountProvider returns fake instance of Mounter
+// GetFakeMountProvider returns fake instance of Mounter
 func GetFakeMountProvider() cpomount.IMount {
 	return &fakemount{BaseMounter: newFakeSafeFormatAndMounter()}
 }
@@ -66,4 +66,8 @@ func (m *fakemount) MakeFile(pathname string) error {
 
 func (m *fakemount) GetDeviceStats(path string) (*cpomount.DeviceStats, error) {
 	return cinder.FakeFsStats, nil
+}
+
+func (m *fakemount) GetMountFs(pathname string) ([]byte, error) {
+	return []byte("aaa"), nil
 }

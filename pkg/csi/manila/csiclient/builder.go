@@ -18,21 +18,36 @@ package csiclient
 
 import (
 	"context"
+	"sync/atomic"
+	"time"
+
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/kubernetes-csi/csi-lib-utils/protosanitizer"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/backoff"
+	"google.golang.org/grpc/credentials/insecure"
 	"k8s.io/klog/v2"
-	"sync/atomic"
-	"time"
 )
 
 var (
 	grpcCallCounter uint64
 
 	dialOptions = []grpc.DialOption{
-		grpc.WithInsecure(),
-		grpc.WithBackoffMaxDelay(time.Second),
-		grpc.WithBlock(),
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithConnectParams(grpc.ConnectParams{
+			Backoff: backoff.Config{
+				BaseDelay:  1.0 * time.Second,
+				Multiplier: 1.6,
+				Jitter:     0.2,
+				MaxDelay:   time.Second,
+			},
+		}),
+		// CSI connections use unix:// so should ignore proxy settings
+		// WithNoProxy can be removed when we update to gRPC >= v1.34,
+		// which contains https://github.com/grpc/grpc-go/pull/3890.
+		// This automatically ignores proxy settings for unix
+		// connections.
+		grpc.WithNoProxy(),
 		grpc.WithUnaryInterceptor(func(ctx context.Context, method string, req, reply interface{}, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {
 			callID := atomic.AddUint64(&grpcCallCounter, 1)
 
@@ -69,7 +84,7 @@ func NewConnection(endpoint string) (*grpc.ClientConn, error) {
 
 	dialFinished := make(chan bool)
 	go func() {
-		conn, err = grpc.Dial(endpoint, dialOptions...)
+		conn, err = grpc.NewClient(endpoint, dialOptions...)
 		close(dialFinished)
 	}()
 
@@ -86,10 +101,6 @@ func NewConnection(endpoint string) (*grpc.ClientConn, error) {
 	}
 }
 
-func NewConnectionWithContext(ctx context.Context, endpoint string) (*grpc.ClientConn, error) {
-	return grpc.DialContext(ctx, endpoint, dialOptions...)
-}
-
 type ClientBuilder struct{}
 
 func (b ClientBuilder) NewConnection(endpoint string) (*grpc.ClientConn, error) {
@@ -97,7 +108,7 @@ func (b ClientBuilder) NewConnection(endpoint string) (*grpc.ClientConn, error) 
 }
 
 func (b ClientBuilder) NewConnectionWithContext(ctx context.Context, endpoint string) (*grpc.ClientConn, error) {
-	return NewConnectionWithContext(ctx, endpoint)
+	return grpc.DialContext(ctx, endpoint, dialOptions...) //nolint:staticcheck
 }
 
 func (b ClientBuilder) NewNodeServiceClient(conn *grpc.ClientConn) Node {

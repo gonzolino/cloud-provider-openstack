@@ -17,18 +17,20 @@ limitations under the License.
 package keystone
 
 import (
+	"context"
 	"crypto/tls"
 	"fmt"
-	"github.com/gophercloud/gophercloud"
-	"github.com/gophercloud/gophercloud/openstack"
-	tokens3 "github.com/gophercloud/gophercloud/openstack/identity/v3/tokens"
-	"github.com/gophercloud/utils/client"
-	"io/ioutil"
+	"net/http"
+	"os"
+
+	"github.com/gophercloud/gophercloud/v2"
+	"github.com/gophercloud/gophercloud/v2/openstack"
+	tokens3 "github.com/gophercloud/gophercloud/v2/openstack/identity/v3/tokens"
+	"github.com/gophercloud/utils/v2/client"
 	certutil "k8s.io/client-go/util/cert"
 	osClient "k8s.io/cloud-provider-openstack/pkg/client"
 	"k8s.io/cloud-provider-openstack/pkg/version"
 	"k8s.io/klog/v2"
-	"net/http"
 )
 
 type Options struct {
@@ -39,7 +41,7 @@ type Options struct {
 }
 
 // GetToken creates a token by authenticate with keystone.
-func GetToken(options Options) (*tokens3.Token, error) {
+func GetToken(ctx context.Context, options Options) (*tokens3.Token, error) {
 	var token *tokens3.Token
 	var setTransport bool
 
@@ -57,13 +59,13 @@ func GetToken(options Options) (*tokens3.Token, error) {
 	provider.UserAgent = userAgent
 
 	if options.ClientCertPath != "" && options.ClientKeyPath != "" {
-		clientCert, err := ioutil.ReadFile(options.ClientCertPath)
+		clientCert, err := os.ReadFile(options.ClientCertPath)
 		if err != nil {
 			msg := fmt.Errorf("failed: Cannot read cert file: %v", err)
 			return token, msg
 		}
 
-		clientKey, err := ioutil.ReadFile(options.ClientKeyPath)
+		clientKey, err := os.ReadFile(options.ClientKeyPath)
 		if err != nil {
 			msg := fmt.Errorf("failed: Cannot read key file: %v", err)
 			return token, msg
@@ -75,7 +77,6 @@ func GetToken(options Options) (*tokens3.Token, error) {
 			return token, msg
 		}
 		tlsConfig.Certificates = []tls.Certificate{cert}
-		tlsConfig.BuildNameToCertificate()
 		setTransport = true
 	}
 
@@ -112,7 +113,7 @@ func GetToken(options Options) (*tokens3.Token, error) {
 	}
 
 	// Issue new unscoped token
-	result := tokens3.Create(v3Client, &options.AuthOptions)
+	result := tokens3.Create(ctx, v3Client, &options.AuthOptions)
 	if result.Err != nil {
 		return token, result.Err
 	}

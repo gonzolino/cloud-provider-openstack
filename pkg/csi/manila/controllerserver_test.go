@@ -16,10 +16,13 @@ package manila
 import (
 	"fmt"
 	"testing"
+
+	"k8s.io/cloud-provider-openstack/pkg/csi"
 )
 
 func TestPrepareShareMetadata(t *testing.T) {
 	ts := []struct {
+		allVolumeParams     map[string]string
 		appendShareMetadata string
 		cluster             string
 		expectedResult      map[string]string
@@ -27,6 +30,7 @@ func TestPrepareShareMetadata(t *testing.T) {
 	}{
 		{
 			// Empty metadata and cluster
+			allVolumeParams:     map[string]string{},
 			appendShareMetadata: "",
 			cluster:             "",
 			expectedResult:      nil,
@@ -34,7 +38,8 @@ func TestPrepareShareMetadata(t *testing.T) {
 		},
 		{
 			// Existing metadata and empty cluster
-			appendShareMetadata: "{\"keyA\": \"valueA\", \"keyB\": \"valueB\"}",
+			allVolumeParams:     map[string]string{"appendShareMetadata": `{"keyA": "valueA", "keyB": "valueB"}`},
+			appendShareMetadata: `{"keyA": "valueA", "keyB": "valueB"}`,
 			cluster:             "",
 			expectedResult:      map[string]string{"keyA": "valueA", "keyB": "valueB"},
 			expectedError:       false,
@@ -48,6 +53,7 @@ func TestPrepareShareMetadata(t *testing.T) {
 		},
 		{
 			// Both metadata and cluster
+			allVolumeParams:     map[string]string{"appendShareMetadata": `{"keyA": "valueA", "keyB": "valueB"}`},
 			appendShareMetadata: "{\"keyA\": \"valueA\", \"keyB\": \"valueB\"}",
 			cluster:             "MyCluster",
 			expectedResult:      map[string]string{"keyA": "valueA", "keyB": "valueB", clusterMetadataKey: "MyCluster"},
@@ -55,6 +61,7 @@ func TestPrepareShareMetadata(t *testing.T) {
 		},
 		{
 			// Overwrite cluster
+			allVolumeParams:     map[string]string{"appendShareMetadata": "{\"keyA\": \"valueA\", \"" + clusterMetadataKey + "\": \"SomeValue\"}"},
 			appendShareMetadata: "{\"keyA\": \"valueA\", \"" + clusterMetadataKey + "\": \"SomeValue\"}",
 			cluster:             "MyCluster",
 			expectedResult:      map[string]string{"keyA": "valueA", clusterMetadataKey: "SomeValue"},
@@ -62,15 +69,50 @@ func TestPrepareShareMetadata(t *testing.T) {
 		},
 		{
 			// Incorrect metadata
+			allVolumeParams:     map[string]string{"appendShareMetadata": "INVALID"},
 			appendShareMetadata: "INVALID",
 			cluster:             "MyCluster",
 			expectedResult:      nil,
 			expectedError:       true,
 		},
+		{
+			// csi-provisioner PV/PVC metadata
+			allVolumeParams: map[string]string{
+				csi.PvcNameKey:      "pvc-name",
+				csi.PvcNamespaceKey: "pvc-namespace",
+				csi.PvNameKey:       "pv-name",
+			},
+			cluster: "",
+			expectedResult: map[string]string{
+				csi.PvcNameKey:      "pvc-name",
+				csi.PvcNamespaceKey: "pvc-namespace",
+				csi.PvNameKey:       "pv-name",
+			},
+			appendShareMetadata: "",
+			expectedError:       false,
+		},
+		{
+			// csi-provisioner PV/PVC metadata with conflicting appendShareMetadata
+			allVolumeParams: map[string]string{
+				csi.PvcNameKey:        "pvc-name",
+				csi.PvcNamespaceKey:   "pvc-namespace",
+				csi.PvNameKey:         "pv-name",
+				"appendShareMetadata": `{"` + csi.PvcNameKey + `": "SomeValue", "keyX": "valueX"}`,
+			},
+			appendShareMetadata: `{"` + csi.PvcNameKey + `": "SomeValue", "keyX": "valueX"}`,
+			cluster:             "",
+			expectedResult: map[string]string{
+				csi.PvcNameKey:      "pvc-name",
+				csi.PvcNamespaceKey: "pvc-namespace",
+				csi.PvNameKey:       "pv-name",
+				"keyX":              "valueX",
+			},
+			expectedError: false,
+		},
 	}
 
 	for i := range ts {
-		result, err := prepareShareMetadata(ts[i].appendShareMetadata, ts[i].cluster)
+		result, err := prepareShareMetadata(ts[i].appendShareMetadata, ts[i].cluster, ts[i].allVolumeParams)
 
 		if err != nil && !ts[i].expectedError {
 			t.Errorf("test %d: unexpected error: %v", i, err)

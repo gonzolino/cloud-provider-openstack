@@ -22,23 +22,26 @@ import (
 	"sync"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
-	"github.com/gophercloud/gophercloud/openstack/sharedfilesystems/v2/shares"
+	"github.com/gophercloud/gophercloud/v2/openstack/sharedfilesystems/v2/shares"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"k8s.io/cloud-provider-openstack/pkg/client"
 	"k8s.io/cloud-provider-openstack/pkg/csi/manila/options"
 	"k8s.io/cloud-provider-openstack/pkg/csi/manila/shareadapters"
 	clouderrors "k8s.io/cloud-provider-openstack/pkg/util/errors"
+	"k8s.io/cloud-provider-openstack/pkg/util/metadata"
 	"k8s.io/klog/v2"
 )
 
 type nodeServer struct {
 	d *Driver
 
+	metadata          metadata.IMetadata
 	supportsNodeStage bool
 	// The result of NodeStageVolume is stashed away for NodePublishVolume(s) that will follow
 	nodeStageCache    map[volumeID]stageCacheEntry
 	nodeStageCacheMtx sync.RWMutex
+	csi.UnimplementedNodeServer
 }
 
 type stageCacheEntry struct {
@@ -47,10 +50,10 @@ type stageCacheEntry struct {
 	publishSecret map[string]string
 }
 
-func (ns *nodeServer) buildVolumeContext(volID volumeID, shareOpts *options.NodeVolumeContext, osOpts *client.AuthOpts) (
+func (ns *nodeServer) buildVolumeContext(ctx context.Context, volID volumeID, shareOpts *options.NodeVolumeContext, osOpts *client.AuthOpts) (
 	volumeContext map[string]string, accessRight *shares.AccessRight, err error,
 ) {
-	manilaClient, err := ns.d.manilaClientBuilder.New(osOpts)
+	manilaClient, err := ns.d.manilaClientBuilder.New(ctx, osOpts)
 	if err != nil {
 		return nil, nil, status.Errorf(codes.Unauthenticated, "failed to create Manila v2 client: %v", err)
 	}
@@ -60,66 +63,55 @@ func (ns *nodeServer) buildVolumeContext(volID volumeID, shareOpts *options.Node
 	var share *shares.Share
 
 	if shareOpts.ShareID != "" {
-		share, err = manilaClient.GetShareByID(shareOpts.ShareID)
+		share, err = manilaClient.GetShareByID(ctx, shareOpts.ShareID)
 		if err != nil {
+			errCode := codes.Internal
 			if clouderrors.IsNotFound(err) {
-				return nil, nil, status.Errorf(codes.NotFound, "share %s not found: %v", shareOpts.ShareID, err)
+				errCode = codes.NotFound
 			}
 
-			return nil, nil, status.Errorf(codes.Internal, "failed to retrieve share %s: %v", shareOpts.ShareID, err)
+			return nil, nil, status.Errorf(errCode, "failed to retrieve volume with share ID %s: %v", shareOpts.ShareID, err)
 		}
 	} else {
-		share, err = manilaClient.GetShareByName(shareOpts.ShareName)
+		share, err = manilaClient.GetShareByName(ctx, shareOpts.ShareName)
 		if err != nil {
+			errCode := codes.Internal
 			if clouderrors.IsNotFound(err) {
-				return nil, nil, status.Errorf(codes.NotFound, "no share named %s found: %v", shareOpts.ShareName, err)
+				errCode = codes.NotFound
 			}
 
-			return nil, nil, status.Errorf(codes.Internal, "failed to retrieve share named %s: %v", shareOpts.ShareName, err)
+			return nil, nil, status.Errorf(errCode, "failed to retrieve volume with share name %s: %v", shareOpts.ShareName, err)
 		}
 	}
 
 	// Verify the plugin supports this share
 
-	if strings.ToLower(share.ShareProto) != strings.ToLower(ns.d.shareProto) {
+	if !strings.EqualFold(share.ShareProto, ns.d.shareProto) {
 		return nil, nil, status.Errorf(codes.InvalidArgument,
-			"wrong share protocol %s for volume %s (share ID %s), the plugin is set to operate in %s",
-			share.ShareProto, volID, share.ID, ns.d.shareProto)
+			"wrong share protocol %s for volume %s, the plugin is set to operate in %s",
+			share.ShareProto, volID, ns.d.shareProto)
 	}
 
 	if share.Status != shareAvailable {
 		if share.Status == shareCreating {
-			return nil, nil, status.Errorf(codes.Unavailable, "share %s for volume %s is in transient creating state", share.ID, volID)
+			return nil, nil, status.Errorf(codes.Unavailable, "volume %s is in transient creating state", volID)
 		}
 
-		return nil, nil, status.Errorf(codes.FailedPrecondition, "invalid share status for volume %s (share ID %s): expected 'available', got '%s'",
-			volID, share.ID, share.Status)
+		return nil, nil, status.Errorf(codes.FailedPrecondition, "invalid share status for volume %s: expected 'available', got '%s'",
+			volID, share.Status)
 	}
 
 	// Get the access right for this share
 
-	accessRights, err := manilaClient.GetAccessRights(share.ID)
+	accessRights, err := manilaClient.GetAccessRights(ctx, share.ID)
 	if err != nil {
-		return nil, nil, status.Errorf(codes.Internal, "failed to list access rights for volume %s (share ID %s): %v",
-			volID, share.ID, err)
-	}
-
-	for i := range accessRights {
-		if accessRights[i].ID == shareOpts.ShareAccessID {
-			accessRight = &accessRights[i]
-			break
-		}
-	}
-
-	if accessRight == nil {
-		return nil, nil, status.Errorf(codes.InvalidArgument, "cannot find access right %s for volume %s (share ID %s)",
-			shareOpts.ShareAccessID, volID, share.ID)
+		return nil, nil, status.Errorf(codes.Internal, "failed to list access rights for volume %s: %v", volID, err)
 	}
 
 	// Retrieve list of all export locations for this share.
 	// Share adapter will try to choose the correct one for mounting.
 
-	availableExportLocations, err := manilaClient.GetExportLocations(share.ID)
+	availableExportLocations, err := manilaClient.GetExportLocations(ctx, share.ID)
 	if err != nil {
 		return nil, nil, status.Errorf(codes.Internal, "failed to list export locations for volume %s: %v", volID, err)
 	}
@@ -127,8 +119,13 @@ func (ns *nodeServer) buildVolumeContext(volID volumeID, shareOpts *options.Node
 	// Build volume context for fwd plugin
 
 	sa := getShareAdapter(ns.d.shareProto)
-
-	volumeContext, err = sa.BuildVolumeContext(&shareadapters.VolumeContextArgs{Locations: availableExportLocations, Options: shareOpts})
+	accessRight = getAccessRightBasedOnShareAdapter(sa, accessRights, shareOpts)
+	opts := &shareadapters.VolumeContextArgs{
+		Locations: availableExportLocations,
+		Share:     share,
+		Options:   shareOpts,
+	}
+	volumeContext, err = sa.BuildVolumeContext(opts)
 	if err != nil {
 		return nil, nil, status.Errorf(codes.InvalidArgument, "failed to build volume context for volume %s: %v", volID, err)
 	}
@@ -137,7 +134,10 @@ func (ns *nodeServer) buildVolumeContext(volID volumeID, shareOpts *options.Node
 }
 
 func buildNodePublishSecret(accessRight *shares.AccessRight, sa shareadapters.ShareAdapter, volID volumeID) (map[string]string, error) {
-	secret, err := sa.BuildNodePublishSecret(&shareadapters.SecretArgs{AccessRight: accessRight})
+	opts := &shareadapters.SecretArgs{
+		AccessRight: accessRight,
+	}
+	secret, err := sa.BuildNodePublishSecret(opts)
 	if err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "failed to build publish secret for volume %s: %v", volID, err)
 	}
@@ -146,7 +146,10 @@ func buildNodePublishSecret(accessRight *shares.AccessRight, sa shareadapters.Sh
 }
 
 func buildNodeStageSecret(accessRight *shares.AccessRight, sa shareadapters.ShareAdapter, volID volumeID) (map[string]string, error) {
-	secret, err := sa.BuildNodeStageSecret(&shareadapters.SecretArgs{AccessRight: accessRight})
+	opts := &shareadapters.SecretArgs{
+		AccessRight: accessRight,
+	}
+	secret, err := sa.BuildNodeStageSecret(opts)
 	if err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "failed to build stage secret for volume %s: %v", volID, err)
 	}
@@ -189,18 +192,17 @@ func (ns *nodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublis
 			volumeCtx, secret = cacheEntry.volumeContext, cacheEntry.publishSecret
 		} else {
 			klog.Warningf("STAGE_UNSTAGE_VOLUME capability is enabled, but node stage cache doesn't contain an entry for %s - this is most likely a bug! Rebuilding staging data anyway...", volID)
-			volumeCtx, accessRight, err = ns.buildVolumeContext(volID, shareOpts, osOpts)
+			volumeCtx, accessRight, err = ns.buildVolumeContext(ctx, volID, shareOpts, osOpts)
 			if err == nil {
 				secret, err = buildNodePublishSecret(accessRight, getShareAdapter(ns.d.shareProto), volID)
 			}
 		}
 	} else {
-		volumeCtx, accessRight, err = ns.buildVolumeContext(volID, shareOpts, osOpts)
+		volumeCtx, accessRight, err = ns.buildVolumeContext(ctx, volID, shareOpts, osOpts)
 		if err == nil {
 			secret, err = buildNodePublishSecret(accessRight, getShareAdapter(ns.d.shareProto), volID)
 		}
 	}
-
 	if err != nil {
 		return nil, err
 	}
@@ -263,7 +265,7 @@ func (ns *nodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStageVol
 	if cacheEntry, ok := ns.nodeStageCache[volID]; ok {
 		volumeCtx, stageSecret = cacheEntry.volumeContext, cacheEntry.stageSecret
 	} else {
-		volumeCtx, accessRight, err = ns.buildVolumeContext(volID, shareOpts, osOpts)
+		volumeCtx, accessRight, err = ns.buildVolumeContext(ctx, volID, shareOpts, osOpts)
 
 		if err == nil {
 			stageSecret, err = buildNodeStageSecret(accessRight, getShareAdapter(ns.d.shareProto), volID)
@@ -273,10 +275,11 @@ func (ns *nodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStageVol
 			publishSecret, err = buildNodePublishSecret(accessRight, getShareAdapter(ns.d.shareProto), volID)
 		}
 
-		ns.nodeStageCache[volID] = stageCacheEntry{volumeContext: volumeCtx, stageSecret: stageSecret, publishSecret: publishSecret}
+		if err == nil {
+			ns.nodeStageCache[volID] = stageCacheEntry{volumeContext: volumeCtx, stageSecret: stageSecret, publishSecret: publishSecret}
+		}
 	}
 	ns.nodeStageCacheMtx.Unlock()
-
 	if err != nil {
 		return nil, err
 	}
@@ -314,14 +317,26 @@ func (ns *nodeServer) NodeUnstageVolume(ctx context.Context, req *csi.NodeUnstag
 }
 
 func (ns *nodeServer) NodeGetInfo(ctx context.Context, req *csi.NodeGetInfoRequest) (*csi.NodeGetInfoResponse, error) {
-	nodeInfo := &csi.NodeGetInfoResponse{
-		NodeId: ns.d.nodeID,
+	nodeID, err := ns.metadata.GetInstanceID()
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "[NodeGetInfo] unable to retrieve instance id of node %v", err)
 	}
 
-	if ns.d.withTopology {
-		nodeInfo.AccessibleTopology = &csi.Topology{
-			Segments: map[string]string{topologyKey: ns.d.nodeAZ},
-		}
+	nodeInfo := &csi.NodeGetInfoResponse{
+		NodeId: nodeID,
+	}
+
+	if !ns.d.withTopology {
+		return nodeInfo, nil
+	}
+
+	zone, err := ns.metadata.GetAvailabilityZone()
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "[NodeGetInfo] Unable to retrieve availability zone of node %v", err)
+	}
+
+	nodeInfo.AccessibleTopology = &csi.Topology{
+		Segments: map[string]string{topologyKey: zone},
 	}
 
 	return nodeInfo, nil
@@ -334,7 +349,13 @@ func (ns *nodeServer) NodeGetCapabilities(ctx context.Context, req *csi.NodeGetC
 }
 
 func (ns *nodeServer) NodeGetVolumeStats(ctx context.Context, req *csi.NodeGetVolumeStatsRequest) (*csi.NodeGetVolumeStatsResponse, error) {
-	return nil, status.Error(codes.Unimplemented, "")
+	csiConn, err := ns.d.csiClientBuilder.NewConnectionWithContext(ctx, ns.d.fwdEndpoint)
+	if err != nil {
+		return nil, status.Error(codes.Unavailable, fmtGrpcConnError(ns.d.fwdEndpoint, err))
+	}
+	defer csiConn.Close()
+
+	return ns.d.csiClientBuilder.NewNodeServiceClient(csiConn).GetVolumeStats(ctx, req)
 }
 
 func (ns *nodeServer) NodeExpandVolume(ctx context.Context, req *csi.NodeExpandVolumeRequest) (*csi.NodeExpandVolumeResponse, error) {

@@ -9,7 +9,7 @@ import (
 var key []byte
 
 func init() {
-	// genereate key for encrypt decrypt operation
+	// generate key for encrypt decrypt operation
 	genKey()
 }
 
@@ -26,6 +26,9 @@ func TestEncryptDecrypt(t *testing.T) {
 func TestEncryptDecryptInvalidData(t *testing.T) {
 	data := []byte("mypassword")
 	cipher, err := Encrypt(data, key)
+	if err != nil {
+		t.FailNow()
+	}
 	_, err = Decrypt(cipher[1:], key)
 	if err == nil {
 		t.FailNow()

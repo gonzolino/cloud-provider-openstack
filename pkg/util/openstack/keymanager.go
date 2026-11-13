@@ -17,21 +17,23 @@ limitations under the License.
 package openstack
 
 import (
+	"context"
 	"fmt"
 	"strings"
 
-	"github.com/gophercloud/gophercloud"
-	"github.com/gophercloud/gophercloud/openstack/keymanager/v1/secrets"
+	"github.com/gophercloud/gophercloud/v2"
+	"github.com/gophercloud/gophercloud/v2/openstack/keymanager/v1/secrets"
 	"k8s.io/cloud-provider-openstack/pkg/metrics"
+	cpoerrors "k8s.io/cloud-provider-openstack/pkg/util/errors"
 )
 
 // EnsureSecret creates a secret if it doesn't exist.
-func EnsureSecret(client *gophercloud.ServiceClient, name string, secretType string, payload string) (string, error) {
-	secret, err := GetSecret(client, name)
+func EnsureSecret(ctx context.Context, client *gophercloud.ServiceClient, name string, secretType string, payload string) (string, error) {
+	secret, err := GetSecret(ctx, client, name)
 	if err != nil {
-		if err == ErrNotFound {
+		if err == cpoerrors.ErrNotFound {
 			// Create a new one
-			return CreateSecret(client, name, secretType, payload)
+			return CreateSecret(ctx, client, name, secretType, payload)
 		}
 
 		return "", err
@@ -41,12 +43,12 @@ func EnsureSecret(client *gophercloud.ServiceClient, name string, secretType str
 }
 
 // GetSecret returns the secret by name
-func GetSecret(client *gophercloud.ServiceClient, name string) (*secrets.Secret, error) {
+func GetSecret(ctx context.Context, client *gophercloud.ServiceClient, name string) (*secrets.Secret, error) {
 	listOpts := secrets.ListOpts{
 		Name: name,
 	}
 	mc := metrics.NewMetricContext("secret", "list")
-	allPages, err := secrets.List(client, listOpts).AllPages()
+	allPages, err := secrets.List(client, listOpts).AllPages(ctx)
 	if mc.ObserveRequest(err) != nil {
 		return nil, err
 	}
@@ -56,17 +58,17 @@ func GetSecret(client *gophercloud.ServiceClient, name string) (*secrets.Secret,
 	}
 
 	if len(allSecrets) == 0 {
-		return nil, ErrNotFound
+		return nil, cpoerrors.ErrNotFound
 	}
 	if len(allSecrets) > 1 {
-		return nil, ErrMultipleResults
+		return nil, cpoerrors.ErrMultipleResults
 	}
 
 	return &allSecrets[0], nil
 }
 
 // CreateSecret creates a secret in Barbican, returns the secret url.
-func CreateSecret(client *gophercloud.ServiceClient, name string, secretType string, payload string) (string, error) {
+func CreateSecret(ctx context.Context, client *gophercloud.ServiceClient, name string, secretType string, payload string) (string, error) {
 	createOpts := secrets.CreateOpts{
 		Name:                   name,
 		Algorithm:              "aes",
@@ -78,30 +80,30 @@ func CreateSecret(client *gophercloud.ServiceClient, name string, secretType str
 		SecretType:             secrets.OpaqueSecret,
 	}
 	mc := metrics.NewMetricContext("secret", "create")
-	secret, err := secrets.Create(client, createOpts).Extract()
+	secret, err := secrets.Create(ctx, client, createOpts).Extract()
 	if mc.ObserveRequest(err) != nil {
 		return "", err
 	}
 	return secret.SecretRef, nil
 }
 
-// ParseSecretID return secret ID from serectRef
+// ParseSecretID return secret ID from secretRef
 func ParseSecretID(ref string) (string, error) {
 	parts := strings.Split(ref, "/")
 	if len(parts) < 2 {
-		return "", fmt.Errorf("Could not parse %s", ref)
+		return "", fmt.Errorf("could not parse %s", ref)
 	}
 
 	return parts[len(parts)-1], nil
 }
 
 // DeleteSecrets deletes all the secrets that including the name string.
-func DeleteSecrets(client *gophercloud.ServiceClient, partName string) error {
+func DeleteSecrets(ctx context.Context, client *gophercloud.ServiceClient, partName string) error {
 	listOpts := secrets.ListOpts{
 		SecretType: secrets.OpaqueSecret,
 	}
 	mc := metrics.NewMetricContext("secret", "list")
-	allPages, err := secrets.List(client, listOpts).AllPages()
+	allPages, err := secrets.List(client, listOpts).AllPages(ctx)
 	if mc.ObserveRequest(err) != nil {
 		return err
 	}
@@ -117,8 +119,8 @@ func DeleteSecrets(client *gophercloud.ServiceClient, partName string) error {
 				return err
 			}
 			mc := metrics.NewMetricContext("secret", "delete")
-			err = secrets.Delete(client, secretID).ExtractErr()
-			if mc.ObserveRequest(err) != nil {
+			err = secrets.Delete(ctx, client, secretID).ExtractErr()
+			if mc.ObserveRequest(err) != nil && !cpoerrors.IsNotFound(err) {
 				return err
 			}
 		}

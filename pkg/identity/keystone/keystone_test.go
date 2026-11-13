@@ -17,10 +17,17 @@ limitations under the License.
 package keystone
 
 import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"reflect"
 	"testing"
 
 	"github.com/spf13/pflag"
+	apiv1 "k8s.io/api/core/v1"
 )
 
 func TestUserAgentFlag(t *testing.T) {
@@ -57,5 +64,157 @@ func TestUserAgentFlag(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// mockKeystoner is a mock implementation of IKeystone for testing
+type mockKeystoner struct{}
+
+func (m *mockKeystoner) GetTokenInfo(ctx context.Context, token string) (*tokenInfo, error) {
+	return nil, fmt.Errorf("invalid token")
+}
+
+func (m *mockKeystoner) GetGroups(ctx context.Context, token string, userID string) ([]string, error) {
+	return nil, fmt.Errorf("invalid token")
+}
+
+func TestWebhookRouting(t *testing.T) {
+	// Create a minimal Auth instance for testing
+	auth := &Auth{
+		authn: &Authenticator{
+			keystoner: &mockKeystoner{},
+		},
+		authz: &Authorizer{
+			pl: nil,
+		},
+		syncer: &Syncer{
+			syncConfig: nil,
+		},
+	}
+
+	tests := []struct {
+		name           string
+		path           string
+		method         string
+		body           map[string]interface{}
+		expectedStatus int
+	}{
+		{
+			name:   "valid_webhook_path",
+			path:   "/webhook",
+			method: http.MethodPost,
+			body: map[string]interface{}{
+				"apiVersion": "authentication.k8s.io/v1beta1",
+				"kind":       "TokenReview",
+				"spec": map[string]interface{}{
+					"token": "test-token",
+				},
+			},
+			// Handler will try to authenticate and fail, but we're testing routing
+			expectedStatus: http.StatusUnauthorized,
+		},
+		{
+			name:           "invalid_path",
+			path:           "/invalid",
+			method:         http.MethodPost,
+			body:           map[string]interface{}{},
+			expectedStatus: http.StatusNotFound,
+		},
+		{
+			name:           "root_path",
+			path:           "/",
+			method:         http.MethodPost,
+			body:           map[string]interface{}{},
+			expectedStatus: http.StatusNotFound,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			// Create a request
+			bodyBytes, _ := json.Marshal(tc.body)
+			req := httptest.NewRequest(tc.method, tc.path, bytes.NewReader(bodyBytes))
+			req.Header.Set("Content-Type", "application/json")
+
+			// Create a response recorder
+			rr := httptest.NewRecorder()
+
+			// Create router and register handler
+			mux := http.NewServeMux()
+			mux.HandleFunc("/webhook", auth.Handler)
+
+			// Serve the request
+			mux.ServeHTTP(rr, req)
+
+			// Check status code
+			if rr.Code != tc.expectedStatus {
+				t.Errorf("Expected status %d, got %d", tc.expectedStatus, rr.Code)
+			}
+		})
+	}
+}
+
+func TestUpdatePolicies(t *testing.T) {
+	existingPolicy := &policy{}
+	auth := &Auth{authz: &Authorizer{pl: policyList{existingPolicy}}}
+
+	err := auth.updatePolicies(&apiv1.ConfigMap{Data: map[string]string{"policies": "{"}}, "kube-system/policy")
+	if err == nil {
+		t.Fatal("expected an invalid policy update to fail")
+	}
+	if len(auth.authz.pl) != 1 || auth.authz.pl[0] != existingPolicy {
+		t.Fatal("invalid policy update replaced the existing policy")
+	}
+
+	err = auth.updatePolicies(&apiv1.ConfigMap{Data: map[string]string{"policies": "[{}]"}}, "kube-system/policy")
+	if err != nil {
+		t.Fatalf("expected a valid policy update to succeed: %v", err)
+	}
+	if len(auth.authz.pl) != 1 || auth.authz.pl[0] == existingPolicy {
+		t.Fatal("valid policy update did not replace the existing policy")
+	}
+}
+
+func TestUpdateSyncConfig(t *testing.T) {
+	tests := []struct {
+		name       string
+		syncConfig string
+	}{
+		{
+			name:       "malformed config",
+			syncConfig: "data-types-to-sync: [projects",
+		},
+		{
+			name:       "invalid config",
+			syncConfig: "data-types-to-sync: [unsupported]",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			existingConfig := &syncConfig{DataTypesToSync: []string{Projects}, NamespaceFormat: "%i"}
+			auth := &Auth{syncer: &Syncer{syncConfig: existingConfig}}
+
+			err := auth.updateSyncConfig(&apiv1.ConfigMap{Data: map[string]string{"syncConfig": tt.syncConfig}}, "kube-system/sync")
+			if err == nil {
+				t.Fatal("expected an invalid sync config update to fail")
+			}
+			if auth.syncer.syncConfig != existingConfig {
+				t.Fatal("invalid sync config update replaced the existing config")
+			}
+		})
+	}
+
+	auth := &Auth{syncer: &Syncer{syncConfig: &syncConfig{}}}
+	err := auth.updateSyncConfig(&apiv1.ConfigMap{Data: map[string]string{
+		"syncConfig": "data-types-to-sync: [projects]\nnamespace-format: prefix-%i"},
+	}, "kube-system/sync")
+	if err != nil {
+		t.Fatalf("expected a valid sync config update to succeed: %v", err)
+	}
+	if auth.syncer.syncConfig.NamespaceFormat != "prefix-%i" ||
+		len(auth.syncer.syncConfig.DataTypesToSync) != 1 ||
+		auth.syncer.syncConfig.DataTypesToSync[0] != Projects {
+		t.Fatalf("valid sync config update was not applied: %#v", auth.syncer.syncConfig)
 	}
 }

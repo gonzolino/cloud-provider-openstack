@@ -1,21 +1,21 @@
 package barbican
 
 import (
-	"github.com/gophercloud/gophercloud"
-	"github.com/gophercloud/gophercloud/openstack"
-	"github.com/gophercloud/gophercloud/openstack/keymanager/v1/secrets"
-	"k8s.io/cloud-provider-openstack/pkg/client"
-)
+	"context"
+	"os"
 
-type BarbicanService interface {
-	GetSecret(keyID string) ([]byte, error)
-}
+	"github.com/gophercloud/gophercloud/v2"
+	"github.com/gophercloud/gophercloud/v2/openstack"
+	"github.com/gophercloud/gophercloud/v2/openstack/keymanager/v1/secrets"
+	"k8s.io/cloud-provider-openstack/pkg/client"
+	"k8s.io/klog/v2"
+)
 
 type KMSOpts struct {
 	KeyID string `gcfg:"key-id"`
 }
 
-//Config to read config options
+// Config to read config options
 type Config struct {
 	Global     client.AuthOpts
 	KeyManager KMSOpts
@@ -28,6 +28,17 @@ type Barbican struct {
 
 // NewBarbicanClient creates new BarbicanClient
 func NewBarbicanClient(cfg Config) (*gophercloud.ServiceClient, error) {
+	if cfg.Global.UseClouds {
+		if cfg.Global.CloudsFile != "" {
+			os.Setenv("OS_CLIENT_CONFIG_FILE", cfg.Global.CloudsFile)
+		}
+		if err := client.ReadClouds(&cfg.Global); err != nil {
+			return nil, err
+		}
+		klog.V(5).Infof("Config, loaded from the %s:", cfg.Global.CloudsFile)
+		client.LogCfg(cfg.Global)
+	}
+
 	provider, err := client.NewOpenStackClient(&cfg.Global, "barbican-kms-plugin")
 	if err != nil {
 		return nil, err
@@ -40,12 +51,12 @@ func NewBarbicanClient(cfg Config) (*gophercloud.ServiceClient, error) {
 }
 
 // GetSecret gets unencrypted secret
-func (barbican *Barbican) GetSecret(keyID string) ([]byte, error) {
+func (barbican *Barbican) GetSecret(ctx context.Context, keyID string) ([]byte, error) {
 	opts := secrets.GetPayloadOpts{
 		PayloadContentType: "application/octet-stream",
 	}
 
-	key, err := secrets.GetPayload(barbican.Client, keyID, opts).Extract()
+	key, err := secrets.GetPayload(ctx, barbican.Client, keyID, opts).Extract()
 	if err != nil {
 		return nil, err
 	}

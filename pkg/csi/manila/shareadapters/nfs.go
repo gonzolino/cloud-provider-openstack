@@ -17,12 +17,13 @@ limitations under the License.
 package shareadapters
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"strings"
 
-	"github.com/gophercloud/gophercloud"
-	"github.com/gophercloud/gophercloud/openstack/sharedfilesystems/v2/shares"
+	"github.com/gophercloud/gophercloud/v2"
+	"github.com/gophercloud/gophercloud/v2/openstack/sharedfilesystems/v2/shares"
 	"k8s.io/cloud-provider-openstack/pkg/csi/manila/runtimeconfig"
 	manilautil "k8s.io/cloud-provider-openstack/pkg/csi/manila/util"
 	"k8s.io/klog/v2"
@@ -32,32 +33,47 @@ type NFS struct{}
 
 var _ ShareAdapter = &NFS{}
 
-func (NFS) GetOrGrantAccess(args *GrantAccessArgs) (*shares.AccessRight, error) {
+func (NFS) GetOrGrantAccesses(ctx context.Context, args *GrantAccessArgs) ([]shares.AccessRight, error) {
 	// First, check if the access right exists or needs to be created
 
-	rights, err := args.ManilaClient.GetAccessRights(args.Share.ID)
+	rights, err := args.ManilaClient.GetAccessRights(ctx, args.Share.ID)
 	if err != nil {
 		if _, ok := err.(gophercloud.ErrResourceNotFound); !ok {
 			return nil, fmt.Errorf("failed to list access rights: %v", err)
 		}
 	}
 
-	// Try to find the access right
+	accessToList := strings.Split(args.Options.NFSShareClient, ",")
 
-	for _, r := range rights {
-		if r.AccessTo == args.Options.NFSShareClient && r.AccessType == "ip" && r.AccessLevel == "rw" {
-			klog.V(4).Infof("IP access right for share %s already exists", args.Share.Name)
-			return &r, nil
+	for _, at := range accessToList {
+		// Try to find the access right
+		found := false
+		for _, r := range rights {
+			if r.AccessTo == at && r.AccessType == "ip" && r.AccessLevel == "rw" {
+				klog.V(4).Infof("IP access right %s for share %s already exists", at, args.Share.Name)
+				found = true
+				break
+			}
+		}
+		// Not found, create it
+		if !found {
+			right, err := args.ManilaClient.GrantAccess(ctx, args.Share.ID, shares.GrantAccessOpts{
+				AccessType:  "ip",
+				AccessLevel: "rw",
+				AccessTo:    at,
+			})
+			if err != nil {
+				return nil, fmt.Errorf("failed to grant access right: %v", err)
+			}
+			activeRight, err := waitForAccessRuleActive(ctx, args.ManilaClient, args.Share.ID, right.ID)
+			if err != nil {
+				return nil, err
+			}
+			rights = append(rights, *activeRight)
 		}
 	}
 
-	// Not found, create it
-
-	return args.ManilaClient.GrantAccess(args.Share.ID, shares.GrantAccessOpts{
-		AccessType:  "ip",
-		AccessLevel: "rw",
-		AccessTo:    args.Options.NFSShareClient,
-	})
+	return rights, nil
 }
 
 func (NFS) BuildVolumeContext(args *VolumeContextArgs) (volumeContext map[string]string, err error) {

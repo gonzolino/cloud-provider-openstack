@@ -18,7 +18,6 @@ package cmd
 
 import (
 	"context"
-	goflag "flag"
 	"fmt"
 	"os"
 	"os/signal"
@@ -27,13 +26,14 @@ import (
 
 	"github.com/mitchellh/go-homedir"
 	"github.com/spf13/cobra"
-	flag "github.com/spf13/pflag"
 	"github.com/spf13/viper"
 	"k8s.io/client-go/tools/leaderelection"
+	"k8s.io/component-base/cli"
 	log "k8s.io/klog/v2"
 
 	"k8s.io/cloud-provider-openstack/pkg/autohealing/config"
 	"k8s.io/cloud-provider-openstack/pkg/autohealing/controller"
+	"k8s.io/cloud-provider-openstack/pkg/version"
 )
 
 var (
@@ -50,10 +50,11 @@ var rootCmd = &cobra.Command{
 		"OpenStack is supported by default.",
 
 	Run: func(cmd *cobra.Command, args []string) {
+		ctx := context.TODO()
 		autohealer := controller.NewController(conf)
 
 		if !conf.LeaderElect {
-			autohealer.Start(context.TODO())
+			autohealer.Start(ctx)
 			panic("unreachable")
 		}
 
@@ -63,7 +64,7 @@ var rootCmd = &cobra.Command{
 		}
 
 		// Try and become the leader and start autohealing loops
-		leaderelection.RunOrDie(context.TODO(), leaderelection.LeaderElectionConfig{
+		leaderelection.RunOrDie(ctx, leaderelection.LeaderElectionConfig{
 			Lock:          lock,
 			LeaseDuration: 20 * time.Second,
 			RenewDeadline: 15 * time.Second,
@@ -77,28 +78,23 @@ var rootCmd = &cobra.Command{
 			Name: "k8s-auto-healer",
 		})
 
-		sigCh := make(chan os.Signal)
+		sigCh := make(chan os.Signal, 1)
 		signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 		<-sigCh
 	},
+	Version: version.Version,
 }
 
 // Execute adds all child commands to the root command sets flags appropriately.
 // This is called by main.main(). It only needs to happen once to the rootCmd.
 func Execute() {
-	if err := rootCmd.Execute(); err != nil {
-		fmt.Println(err)
-		os.Exit(-1)
-	}
+	code := cli.Run(rootCmd)
+	os.Exit(code)
 }
 
 func init() {
 	cobra.OnInitialize(initConfig)
 	rootCmd.PersistentFlags().StringVar(&cfgFile, "config", "", "config file (default is $HOME/.kube_autohealer_config.yaml)")
-
-	log.InitFlags(nil)
-	goflag.CommandLine.Parse(nil)
-	flag.CommandLine.AddGoFlagSet(goflag.CommandLine)
 }
 
 // initConfig reads in config file and ENV variables if set.
@@ -123,7 +119,7 @@ func initConfig() {
 
 	// If a config file is found, read it in.
 	if err := viper.ReadInConfig(); err != nil {
-		log.Fatalf("Failed to read config file, error: %s", err)
+		log.Fatalf("Failed to read config file, error: %v", err)
 	}
 
 	log.Infof("Using config file %s", viper.ConfigFileUsed())

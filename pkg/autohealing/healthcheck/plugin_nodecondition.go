@@ -17,13 +17,13 @@ limitations under the License.
 package healthcheck
 
 import (
+	"context"
 	"fmt"
+	"slices"
 	"time"
 
 	"github.com/mitchellh/mapstructure"
 	log "k8s.io/klog/v2"
-
-	"k8s.io/cloud-provider-openstack/pkg/autohealing/utils"
 )
 
 const (
@@ -45,22 +45,22 @@ type NodeConditionCheck struct {
 }
 
 // Check checks the node health, returns false if the node is unhealthy.
-func (check *NodeConditionCheck) Check(node NodeInfo, controller NodeController) bool {
+func (check *NodeConditionCheck) Check(ctx context.Context, node NodeInfo, controller NodeController) bool {
 	nodeName := node.KubeNode.Name
 
 	for _, cond := range node.KubeNode.Status.Conditions {
-		if utils.Contains(check.Types, string(cond.Type)) {
-			unhealthyDuration := time.Now().Sub(cond.LastTransitionTime.Time)
+		if slices.Contains(check.Types, string(cond.Type)) {
+			unhealthyDuration := time.Since(cond.LastTransitionTime.Time)
 
 			if len(check.ErrorValues) > 0 {
-				if utils.Contains(check.ErrorValues, string(cond.Status)) {
+				if slices.Contains(check.ErrorValues, string(cond.Status)) {
 					if unhealthyDuration >= check.UnhealthyDuration {
 						return false
 					}
 					log.Warningf("Node %s is unhealthy, %s: %s", nodeName, string(cond.Type), string(cond.Status))
 				}
 			} else if len(check.OKValues) > 0 {
-				if !utils.Contains(check.OKValues, string(cond.Status)) {
+				if !slices.Contains(check.OKValues, string(cond.Status)) {
 					if unhealthyDuration >= check.UnhealthyDuration {
 						return false
 					}
@@ -88,7 +88,7 @@ func (check *NodeConditionCheck) IsWorkerSupported() bool {
 	return true
 }
 
-func newNodeConditionCheck(config interface{}) (HealthCheck, error) {
+func NewNodeConditionCheck(config interface{}) (HealthCheck, error) {
 	check := NodeConditionCheck{
 		UnhealthyDuration: 300 * time.Second,
 		Types:             []string{"Ready"},
@@ -109,8 +109,4 @@ func newNodeConditionCheck(config interface{}) (HealthCheck, error) {
 	}
 
 	return &check, nil
-}
-
-func init() {
-	registerHealthCheck(NodeConditionType, newNodeConditionCheck)
 }

@@ -1,7 +1,12 @@
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  name: system:openstack-cloud-controller-manager
+  name: {{ .Values.clusterRoleName }}
+  labels: {{- include "occm.labels.standard" . | nindent 4 }}
+  annotations:
+    {{- with .Values.commonAnnotations }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
 rules:
 - apiGroups:
   - coordination.k8s.io
@@ -24,7 +29,12 @@ rules:
   resources:
   - nodes
   verbs:
-  - '*'
+  - get
+  - list
+  - watch
+  - patch
+  - update
+  - delete
 - apiGroups:
   - ""
   resources:
@@ -43,16 +53,22 @@ rules:
 - apiGroups:
   - ""
   resources:
+  - services/status
+  verbs:
+  - patch
+- apiGroups:
+  - ""
+  resources:
+  - serviceaccounts/token
+  verbs:
+  - create
+- apiGroups:
+  - ""
+  resources:
   - serviceaccounts
   verbs:
   - create
   - get
-- apiGroups:
-  - ""
-  resources:
-  - persistentvolumes
-  verbs:
-  - '*'
 - apiGroups:
   - ""
   resources:
@@ -70,12 +86,4 @@ rules:
   verbs:
   - get
   - list
-  - watch
-- apiGroups:
-  - ""
-  resources:
-  - secrets
-  verbs:
-  - list
-  - get
   - watch

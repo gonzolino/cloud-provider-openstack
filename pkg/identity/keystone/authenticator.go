@@ -17,12 +17,13 @@ limitations under the License.
 package keystone
 
 import (
+	"context"
 	"fmt"
 
-	"github.com/gophercloud/gophercloud"
-	"github.com/gophercloud/gophercloud/openstack/identity/v3/groups"
-	"github.com/gophercloud/gophercloud/openstack/identity/v3/tokens"
-	"github.com/gophercloud/gophercloud/openstack/identity/v3/users"
+	"github.com/gophercloud/gophercloud/v2"
+	"github.com/gophercloud/gophercloud/v2/openstack/identity/v3/groups"
+	"github.com/gophercloud/gophercloud/v2/openstack/identity/v3/tokens"
+	"github.com/gophercloud/gophercloud/v2/openstack/identity/v3/users"
 	"k8s.io/apiserver/pkg/authentication/user"
 )
 
@@ -37,8 +38,8 @@ type tokenInfo struct {
 }
 
 type IKeystone interface {
-	GetTokenInfo(string) (*tokenInfo, error)
-	GetGroups(string, string) ([]string, error)
+	GetTokenInfo(context.Context, string) (*tokenInfo, error)
+	GetGroups(context.Context, string, string) ([]string, error)
 }
 
 type Keystoner struct {
@@ -51,9 +52,10 @@ func NewKeystoner(client *gophercloud.ServiceClient) *Keystoner {
 	}
 }
 
-func (k *Keystoner) GetTokenInfo(token string) (*tokenInfo, error) {
-	k.client.ProviderClient.SetToken(token)
-	ret := tokens.Get(k.client, token)
+// revive:disable:unexported-return
+func (k *Keystoner) GetTokenInfo(ctx context.Context, token string) (*tokenInfo, error) {
+	k.client.SetToken(token)
+	ret := tokens.Get(ctx, k.client, token)
 
 	tokenUser, err := ret.ExtractUser()
 	if err != nil {
@@ -64,13 +66,16 @@ func (k *Keystoner) GetTokenInfo(token string) (*tokenInfo, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to extract project information from Keystone response: %v", err)
 	}
+	if project == nil {
+		return nil, fmt.Errorf("failed to extract project information from Keystone response")
+	}
 
 	roles, err := ret.ExtractRoles()
 	if err != nil {
 		return nil, fmt.Errorf("failed to extract roles information from Keystone response: %v", err)
 	}
 
-	var userRoles []string
+	userRoles := make([]string, 0, len(roles))
 	for _, role := range roles {
 		userRoles = append(userRoles, role.Name)
 	}
@@ -86,20 +91,21 @@ func (k *Keystoner) GetTokenInfo(token string) (*tokenInfo, error) {
 	}, nil
 }
 
-func (k *Keystoner) GetGroups(token string, userID string) ([]string, error) {
-	var userGroups []string
+// revive:enable:unexported-return
 
-	k.client.ProviderClient.SetToken(token)
-	allGroupPages, err := users.ListGroups(k.client, userID).AllPages()
+func (k *Keystoner) GetGroups(ctx context.Context, token string, userID string) ([]string, error) {
+	k.client.SetToken(token)
+	allGroupPages, err := users.ListGroups(k.client, userID).AllPages(ctx)
 	if err != nil {
-		return userGroups, fmt.Errorf("failed to get user groups from Keystone: %v", err)
+		return nil, fmt.Errorf("failed to get user groups from Keystone: %v", err)
 	}
 
 	allGroups, err := groups.ExtractGroups(allGroupPages)
 	if err != nil {
-		return userGroups, fmt.Errorf("failed to extract user groups from Keystone response: %v", err)
+		return nil, fmt.Errorf("failed to extract user groups from Keystone response: %v", err)
 	}
 
+	userGroups := make([]string, 0, len(allGroups))
 	for _, g := range allGroups {
 		userGroups = append(userGroups, g.Name)
 	}
@@ -113,13 +119,13 @@ type Authenticator struct {
 }
 
 // AuthenticateToken checks the token via Keystone call
-func (a *Authenticator) AuthenticateToken(token string) (user.Info, bool, error) {
-	tokenInfo, err := a.keystoner.GetTokenInfo(token)
+func (a *Authenticator) AuthenticateToken(ctx context.Context, token string) (user.Info, bool, error) {
+	tokenInfo, err := a.keystoner.GetTokenInfo(ctx, token)
 	if err != nil {
 		return nil, false, fmt.Errorf("failed to authenticate: %v", err)
 	}
 
-	userGroups, err := a.keystoner.GetGroups(token, tokenInfo.userID)
+	userGroups, err := a.keystoner.GetGroups(ctx, token, tokenInfo.userID)
 	if err != nil {
 		return nil, false, fmt.Errorf("failed to authenticate: %v", err)
 	}

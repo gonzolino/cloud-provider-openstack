@@ -17,7 +17,7 @@ limitations under the License.
 package cmd
 
 import (
-	"flag"
+	"context"
 	"fmt"
 	"os"
 	"os/signal"
@@ -30,6 +30,8 @@ import (
 
 	"k8s.io/cloud-provider-openstack/pkg/ingress/config"
 	"k8s.io/cloud-provider-openstack/pkg/ingress/controller"
+	"k8s.io/cloud-provider-openstack/pkg/version"
+	"k8s.io/component-base/cli"
 	"k8s.io/klog/v2"
 )
 
@@ -46,23 +48,23 @@ var rootCmd = &cobra.Command{
 	Long:  `Ingress controller for OpenStack`,
 
 	Run: func(cmd *cobra.Command, args []string) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
 		osIngress := controller.NewController(conf)
-		osIngress.Start()
+		osIngress.Start(ctx)
 
 		sigterm := make(chan os.Signal, 1)
-		signal.Notify(sigterm, syscall.SIGTERM)
-		signal.Notify(sigterm, syscall.SIGINT)
+		signal.Notify(sigterm, syscall.SIGTERM, syscall.SIGINT)
 		<-sigterm
 	},
+	Version: version.Version,
 }
 
 // Execute adds all child commands to the root command sets flags appropriately.
 // This is called by main.main(). It only needs to happen once to the rootCmd.
 func Execute() {
-	if err := rootCmd.Execute(); err != nil {
-		fmt.Println(err)
-		os.Exit(-1)
-	}
+	code := cli.Run(rootCmd)
+	os.Exit(code)
 }
 
 func init() {
@@ -79,9 +81,7 @@ func init() {
 	rootCmd.PersistentFlags().StringVar(&cfgFile, "config", "", "config file (default is $HOME/.ingress_openstack.yaml)")
 	rootCmd.PersistentFlags().BoolVar(&isDebug, "debug", false, "Print more detailed information.")
 
-	klogFlags := flag.NewFlagSet("klog", flag.ExitOnError)
-	klog.InitFlags(klogFlags)
-	rootCmd.PersistentFlags().AddGoFlagSet(klogFlags)
+	klog.InitFlags(nil)
 }
 
 // initConfig reads in config file and ENV variables if set.

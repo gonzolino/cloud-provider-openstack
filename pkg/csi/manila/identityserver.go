@@ -18,18 +18,27 @@ package manila
 
 import (
 	"context"
+
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"k8s.io/klog/v2"
 )
 
 type identityServer struct {
 	d *Driver
+	csi.UnimplementedIdentityServer
 }
 
 func (ids *identityServer) GetPluginInfo(ctx context.Context, req *csi.GetPluginInfoRequest) (*csi.GetPluginInfoResponse, error) {
+	klog.V(5).Infof("Using default GetPluginInfo")
+
 	if ids.d.name == "" {
 		return nil, status.Error(codes.Unavailable, "Driver name not configured")
+	}
+
+	if ids.d.fqVersion == "" {
+		return nil, status.Error(codes.Unavailable, "Driver is missing version")
 	}
 
 	return &csi.GetPluginInfoResponse{
@@ -49,11 +58,19 @@ func (ids *identityServer) Probe(ctx context.Context, req *csi.ProbeRequest) (*c
 }
 
 func (ids *identityServer) GetPluginCapabilities(ctx context.Context, req *csi.GetPluginCapabilitiesRequest) (*csi.GetPluginCapabilitiesResponse, error) {
+	klog.V(5).Infof("GetPluginCapabilities called with req %+v", req)
 	caps := []*csi.PluginCapability{
 		{
 			Type: &csi.PluginCapability_Service_{
 				Service: &csi.PluginCapability_Service{
 					Type: csi.PluginCapability_Service_CONTROLLER_SERVICE,
+				},
+			},
+		},
+		{
+			Type: &csi.PluginCapability_VolumeExpansion_{
+				VolumeExpansion: &csi.PluginCapability_VolumeExpansion{
+					Type: csi.PluginCapability_VolumeExpansion_ONLINE,
 				},
 			},
 		},

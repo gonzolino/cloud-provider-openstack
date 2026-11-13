@@ -9,7 +9,9 @@
   - [Volume Expansion](#volume-expansion)
     - [Rescan on in-use volume resize](#rescan-on-in-use-volume-resize)
   - [Volume Snapshots](#volume-snapshots)
-  - [Inline Volumes](#inline-volumes)
+  - [Ephemeral Volumes](#ephemeral-volumes)
+    - [[DEPRECATED] CSI Ephemeral Volumes](#deprecated-csi-ephemeral-volumes)
+    - [Generic Ephemeral Volumes](#generic-ephemeral-volumes)
   - [Volume Cloning](#volume-cloning)
   - [Multi-Attach Volumes](#multi-attach-volumes)
   - [Liveness probe](#liveness-probe)
@@ -20,7 +22,7 @@
 
 ## Dynamic Provisioning
 
-Dynamic Provisoning uses persistence volume claim (PVC) to request the Kuberenetes to create the Cinder volume on behalf of user and consumes the volume from inside container.
+Dynamic Provisioning uses persistence volume claim (PVC) to request the Kubernetes to create the Cinder volume on behalf of user and consumes the volume from inside container.
 
 For usage, refer [sample app](./examples.md#dynamic-volume-provisioning)  
 
@@ -32,11 +34,14 @@ This feature enables driver to consider the topology constraints while creating 
 * Supported topology keys:
   `topology.cinder.csi.openstack.org/zone` : Availability by Zone
 * `allowedTopologies` can be specified in storage class to restrict the topology of provisioned volumes to specific zones and should be used as replacement of `availability` parameter.
-* To disable: set `--feature-gates=Topology=false` in external-provisioner (container `csi-provisioner` of `csi-cinder-controllerplugin`).
+* To disable, pass `--with-topology=false` to both the controller and node Cinder CSI driver services.
+  * With Helm, set `.Values.csi.provisioner.topology: "false"`.
+
+For usage, refer [sample app](./examples.md#use-topology)
 
 ## Block Volume
 
-Cinder volumes to be exposed inside containers as a block device instead of as a mounted file system. The corresponding CSI feature (CSIBlockVolume) is GA since Kubernetes 1.18.
+Cinder volumes to be exposed inside containers as a block device instead of as a mounted file system. The corresponding CSI feature (CSIBlockVolume) is GA since Kubernetes v1.18.
 
 Prerequisites to use the feature:
 * Make sure the volumeMode is `Block` in Persistence Volume Claim Spec
@@ -49,25 +54,31 @@ For usage, refer [sample app](./examples.md#using-block-volume)
 Driver supports both `Offline` and `Online` resize of cinder volumes. Cinder online resize support is available since cinder 3.42 microversion. 
 The same should be supported by underlying OpenStack Cloud to avail the feature.
 
-* As of kubernetes v1.16, Volume Expansion is a beta feature and enabled by default.
+* As of Kubernetes v1.16, Volume Expansion is a beta feature and enabled by default.
 * Make sure to set `allowVolumeExpansion` to `true` in Storage class spec.
-* For usage, refer [sample app](./examples.md#volume-expansion-example)
+
+For usage, refer [sample app](./examples.md#volume-expansion-example)
 
 ### Rescan on in-use volume resize
 
-Some hypervizors (like VMware) don't automatically send a new volume size to a Linux kernel, when a volume is in-use. Sending a "1" to `/sys/class/block/XXX/device/rescan` is telling the SCSI block device to refresh it's information about where it's ending boundary is (among other things) to give the kernel information about it's updated size. When a `rescan-on-resize` flag is set in a CSI node driver cloud-config `[BlockStorage]` section, a CSI node driver will rescan block device and verify its size before expanding the filesystem. CSI driver will raise an error, when expected volume size cannot be detected.
+Some hypervisors (like VMware) don't automatically send a new volume size to a Linux kernel, when a volume is in-use. Sending a "1" to `/sys/class/block/XXX/device/rescan` is telling the SCSI block device to refresh it's information about where it's ending boundary is (among other things) to give the kernel information about it's updated size. When a `rescan-on-resize` flag is set in a CSI node driver cloud-config `[BlockStorage]` section, a CSI node driver will rescan block device and verify its size before expanding the filesystem. CSI driver will raise an error, when expected volume size cannot be detected.
 
-Not all hypervizors have a `/sys/class/block/XXX/device/rescan` location, therefore if you enable this option and your hypervizor doesn't support this, you'll get a warning log on resize event. It is recommended to disable this option in this case.
+Not all hypervisors have a `/sys/class/block/XXX/device/rescan` location, therefore if you enable this option and your hypervisor doesn't support this, you'll get a warning log on resize event. It is recommended to disable this option in this case.
 
 ## Volume Snapshots
 
-This feature enables creating volume snapshots and restore volume from snapshot. The corresponding CSI feature (VolumeSnapshotDataSource) is beta since Kubernetes 1.17.
+This feature enables creating volume snapshots and restore volume from snapshot. The corresponding CSI feature (VolumeSnapshotDataSource) is GA since Kubernetes v1.20.
 
-* CSI external-snapshotter v2.0.0 and higher is beta, version below v2.0.0 is Alpha. Since beta version, it requires `Snapshot Controller` to be deployed in the cluster.
 * To avail the feature. deploy the snapshot-controller and CRDs as part of their Kubernetes cluster management process (independent of any CSI Driver) . For more info, refer [Snapshot Controller](https://kubernetes-csi.github.io/docs/snapshot-controller.html)
-* For example on using snapshot feature, refer [sample app](./examples#snapshot-create-and-restore)
+* For example on using snapshot feature, refer [sample app](./examples.md#snapshot-create-and-restore)
 
-## Inline Volumes
+## Ephemeral Volumes
+
+Two different Kubernetes features allow volumes to follow the Pod's lifecycle: CSI Ephemeral Volumes and Generic Ephemeral Volumes
+
+### [DEPRECATED] CSI Ephemeral Volumes
+
+**Note: This feature support is deprecated in v1.24 release in favor of [Generic Ephemeral Volumes](#generic-ephemeral-volumes) and will no longer be available from v1.27.**
 
 This feature allows CSI volumes to be directly embedded in the Pod specification instead of a PersistentVolume. Volumes specified in this way are ephemeral and do not persist across Pod restarts.
 
@@ -76,13 +87,19 @@ This feature allows CSI volumes to be directly embedded in the Pod specification
 * `podInfoOnMount` must be `true` to use this feature.
 * For usage, refer [sample app](./examples.md#deploy-app-using-inline-volumes)
 
+### Generic Ephemeral Volumes
+
+As of Kubernetes v1.21, this is beta feature and enabled by default.
+
+The key design idea is that the parameters for a volume claim are allowed inside a volume source of the Pod. For sample app, refer [here](./examples.md#generic-ephemeral-volumes)
+
 ## Volume Cloning
 
 This feature enables cloning a volume from existing PVCs in Kubernetes. As of Kubernetes v1.16, volume cloning is beta feature and enabled by default.
 
 Prerequisites:
 * The source PVC must be bound and available (not in use).
-* source and destination PVCs must be in the same namespace.
+* Source and destination PVCs must be in the same namespace.
 * Cloning is only supported within the same Storage Class. Destination volume must be the same storage class as the source
 
 For example, refer [sample app](../../examples/cinder-csi-plugin/clone)
@@ -97,6 +114,6 @@ This should enable to attach a volume to multiple hosts/servers simultaneously.
 
 ## Liveness probe
 
-The [liveness probe](https://github.com/kubernetes-csi/livenessprobe) is a sidecar container that exposes an HTTP /healthz endpoint, which serves as kubelet's livenessProbe hook to monitor health of a CSI driver.
+The [liveness probe](https://github.com/kubernetes-csi/livenessprobe) is a sidecar container that exposes an HTTP `/healthz` endpoint, which serves as kubelet's `livenessProbe` hook to monitor health of a CSI driver.
 
 Cinder CSI driver added liveness probe side container by default and refer to [manifest](../../manifests/cinder-csi-plugin/cinder-csi-controllerplugin.yaml) and [charts](../../charts/cinder-csi-plugin) for more information.

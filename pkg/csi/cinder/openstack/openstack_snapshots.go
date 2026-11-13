@@ -19,14 +19,17 @@ limitations under the License.
 package openstack
 
 import (
+	"context"
 	"fmt"
 	"net/url"
 	"strconv"
 	"time"
 
-	"github.com/gophercloud/gophercloud/openstack/blockstorage/v3/snapshots"
-	"github.com/gophercloud/gophercloud/pagination"
+	"github.com/gophercloud/gophercloud/v2/openstack/blockstorage/v3/snapshots"
+	"github.com/gophercloud/gophercloud/v2/pagination"
 	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/cloud-provider-openstack/pkg/metrics"
+	cpoerrors "k8s.io/cloud-provider-openstack/pkg/util/errors"
 	"k8s.io/klog/v2"
 )
 
@@ -36,25 +39,29 @@ const (
 	snapReadyFactor     = 1.2
 	snapReadySteps      = 10
 
-	snapshotDescription = "Created by OpenStack Cinder CSI driver"
-	snapshotForceCreate = "force-create"
+	snapshotDescription          = "Created by OpenStack Cinder CSI driver"
+	SnapshotForceCreate          = "force-create"
+	SnapshotType                 = "type"
+	SnapshotAvailabilityZone     = "availability"
+	SnapshotAppendVolumeMetadata = "appendVolumeMetadata"
+	SnapshotIncremental          = "incremental"
 )
 
 // CreateSnapshot issues a request to take a Snapshot of the specified Volume with the corresponding ID and
 // returns the resultant gophercloud Snapshot Item upon success
-func (os *OpenStack) CreateSnapshot(name, volID string, tags *map[string]string) (*snapshots.Snapshot, error) {
+func (os *OpenStack) CreateSnapshot(ctx context.Context, name, volID string, tags map[string]string) (*snapshots.Snapshot, error) {
 
 	force := false
 	// if no flag given, then force will be false by default
 	// if flag it given , check it
-	if item, ok := (*tags)[snapshotForceCreate]; ok {
+	if item, ok := (tags)[SnapshotForceCreate]; ok {
 		var err error
 		force, err = strconv.ParseBool(item)
 		if err != nil {
 			klog.V(5).Infof("Make force create flag to false due to: %v", err)
 		}
 
-		delete(*tags, snapshotForceCreate)
+		delete(tags, SnapshotForceCreate)
 	}
 	// Force the creation of snapshot even the Volume is in in-use state
 	opts := &snapshots.CreateOpts{
@@ -64,12 +71,12 @@ func (os *OpenStack) CreateSnapshot(name, volID string, tags *map[string]string)
 		Force:       force,
 	}
 	if tags != nil {
-		opts.Metadata = *tags
+		opts.Metadata = tags
 	}
 	// TODO: Do some check before really call openstack API on the input
-
-	snap, err := snapshots.Create(os.blockstorage, opts).Extract()
-	if err != nil {
+	mc := metrics.NewMetricContext("snapshot", "create")
+	snap, err := snapshots.Create(ctx, os.blockstorage, opts).Extract()
+	if mc.ObserveRequest(err) != nil {
 		return &snapshots.Snapshot{}, err
 	}
 	// There's little value in rewrapping these gophercloud types into yet another abstraction/type, instead just
@@ -81,7 +88,7 @@ func (os *OpenStack) CreateSnapshot(name, volID string, tags *map[string]string)
 // provide the ability to provide limit and offset to enable the consumer to provide accurate pagination.
 // In addition the filters argument provides a mechanism for passing in valid filter strings to the list
 // operation.  Valid filter keys are:  Name, Status, VolumeID, Limit, Marker (TenantID has no effect)
-func (os *OpenStack) ListSnapshots(filters map[string]string) ([]snapshots.Snapshot, string, error) {
+func (os *OpenStack) ListSnapshots(ctx context.Context, filters map[string]string) ([]snapshots.Snapshot, string, error) {
 	var nextPageToken string
 	var snaps []snapshots.Snapshot
 
@@ -103,7 +110,8 @@ func (os *OpenStack) ListSnapshots(filters map[string]string) ([]snapshots.Snaps
 			klog.V(3).Infof("Not a valid filter key %s", key)
 		}
 	}
-	err := snapshots.List(os.blockstorage, opts).EachPage(func(page pagination.Page) (bool, error) {
+	mc := metrics.NewMetricContext("snapshot", "list")
+	err := snapshots.List(os.blockstorage, opts).EachPage(ctx, func(_ context.Context, page pagination.Page) (bool, error) {
 		var err error
 
 		snaps, err = snapshots.ExtractSnapshots(page)
@@ -117,35 +125,70 @@ func (os *OpenStack) ListSnapshots(filters map[string]string) ([]snapshots.Snaps
 		}
 
 		if nextPageURL != "" {
-			queryParams, err := url.ParseQuery(nextPageURL)
+			pageURL, err := url.Parse(nextPageURL)
 			if err != nil {
 				return false, err
 			}
-			nextPageToken = queryParams.Get("marker")
+			nextPageToken = pageURL.Query().Get("marker")
 		}
 
 		return false, nil
 	})
-	if err != nil {
+	if mc.ObserveRequest(err) != nil {
 		return nil, nextPageToken, err
 	}
 
 	return snaps, nextPageToken, nil
 }
 
-// DeleteSnapshot issues a request to delete the Snapshot with the specified ID from the Cinder backend
-func (os *OpenStack) DeleteSnapshot(snapID string) error {
-	err := snapshots.Delete(os.blockstorage, snapID).ExtractErr()
-	if err != nil {
+// DeleteSnapshot issues a request to delete the Snapshot with the specified ID from the Cinder backend.
+// Cinder accepts the delete immediately (202) and finishes it in the background. Returning before the
+// snapshot is actually gone lets the snapshotter drop the VolumeSnapshot while a backend delete later fails.
+func (os *OpenStack) DeleteSnapshot(ctx context.Context, snapID string) error {
+	mc := metrics.NewMetricContext("snapshot", "delete")
+	err := snapshots.Delete(ctx, os.blockstorage, snapID).ExtractErr()
+	if mc.ObserveRequest(err) != nil {
 		klog.Errorf("Failed to delete snapshot: %v", err)
+		return err
+	}
+	return os.waitSnapshotDeleted(ctx, snapID)
+}
+
+func (os *OpenStack) waitSnapshotDeleted(ctx context.Context, snapID string) error {
+	return waitSnapshotDeleted(ctx, snapID, wait.Backoff{
+		Duration: snapReadyDuration,
+		Factor:   snapReadyFactor,
+		Steps:    snapReadySteps,
+	}, os.GetSnapshotByID)
+}
+
+func waitSnapshotDeleted(ctx context.Context, snapID string, backoff wait.Backoff, get func(context.Context, string) (*snapshots.Snapshot, error)) error {
+	err := wait.ExponentialBackoffWithContext(ctx, backoff, func(ctx context.Context) (bool, error) {
+		snap, err := get(ctx, snapID)
+		if cpoerrors.IsNotFound(err) {
+			return true, nil
+		}
+		if err != nil {
+			return false, err
+		}
+		switch snap.Status {
+		case "error", "error_deleting":
+			return false, fmt.Errorf("snapshot %s entered status %s", snapID, snap.Status)
+		default:
+			return false, nil
+		}
+	})
+	if wait.Interrupted(err) {
+		return fmt.Errorf("timeout waiting for snapshot %s to be deleted", snapID)
 	}
 	return err
 }
 
-//GetSnapshotByID returns snapshot details by id
-func (os *OpenStack) GetSnapshotByID(snapshotID string) (*snapshots.Snapshot, error) {
-	s, err := snapshots.Get(os.blockstorage, snapshotID).Extract()
-	if err != nil {
+// GetSnapshotByID returns snapshot details by id
+func (os *OpenStack) GetSnapshotByID(ctx context.Context, snapshotID string) (*snapshots.Snapshot, error) {
+	mc := metrics.NewMetricContext("snapshot", "get")
+	s, err := snapshots.Get(ctx, os.blockstorage, snapshotID).Extract()
+	if mc.ObserveRequest(err) != nil {
 		klog.Errorf("Failed to get snapshot: %v", err)
 		return nil, err
 	}
@@ -153,7 +196,7 @@ func (os *OpenStack) GetSnapshotByID(snapshotID string) (*snapshots.Snapshot, er
 }
 
 // WaitSnapshotReady waits till snapshot is ready
-func (os *OpenStack) WaitSnapshotReady(snapshotID string) error {
+func (os *OpenStack) WaitSnapshotReady(ctx context.Context, snapshotID string) (string, error) {
 	backoff := wait.Backoff{
 		Duration: snapReadyDuration,
 		Factor:   snapReadyFactor,
@@ -161,22 +204,28 @@ func (os *OpenStack) WaitSnapshotReady(snapshotID string) error {
 	}
 
 	err := wait.ExponentialBackoff(backoff, func() (bool, error) {
-		ready, err := os.snapshotIsReady(snapshotID)
+		ready, err := os.snapshotIsReady(ctx, snapshotID)
 		if err != nil {
 			return false, err
 		}
 		return ready, nil
 	})
 
-	if err == wait.ErrWaitTimeout {
-		err = fmt.Errorf("Timeout, Snapshot  %s is still not Ready %v", snapshotID, err)
+	if wait.Interrupted(err) {
+		err = fmt.Errorf("timeout, Snapshot %s is still not Ready %v", snapshotID, err)
 	}
 
-	return err
+	snap, _ := os.GetSnapshotByID(ctx, snapshotID)
+
+	if snap != nil {
+		return snap.Status, err
+	} else {
+		return "Failed to get snapshot status", err
+	}
 }
 
-func (os *OpenStack) snapshotIsReady(snapshotID string) (bool, error) {
-	snap, err := os.GetSnapshotByID(snapshotID)
+func (os *OpenStack) snapshotIsReady(ctx context.Context, snapshotID string) (bool, error) {
+	snap, err := os.GetSnapshotByID(ctx, snapshotID)
 	if err != nil {
 		return false, err
 	}

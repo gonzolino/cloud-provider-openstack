@@ -29,43 +29,26 @@ import (
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/kubernetes-csi/csi-lib-utils/protosanitizer"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+	v1 "k8s.io/client-go/listers/core/v1"
 	"k8s.io/cloud-provider-openstack/pkg/csi/manila/csiclient"
 	"k8s.io/cloud-provider-openstack/pkg/csi/manila/manilaclient"
-	"k8s.io/cloud-provider-openstack/pkg/csi/manila/options"
+	"k8s.io/cloud-provider-openstack/pkg/util/metadata"
 	"k8s.io/cloud-provider-openstack/pkg/version"
 	"k8s.io/klog/v2"
 )
 
-type DriverOpts struct {
-	DriverName   string
-	NodeID       string
-	NodeAZ       string
-	WithTopology bool
-	ShareProto   string
-	ClusterID    string
-
-	ServerCSIEndpoint string
-	FwdCSIEndpoint    string
-
-	ManilaClientBuilder manilaclient.Builder
-	CSIClientBuilder    csiclient.Builder
-
-	CompatOpts *options.CompatibilityOptions
-}
-
 type Driver struct {
-	nodeID       string
-	nodeAZ       string
+	name       string
+	fqVersion  string // Fully qualified version in format {driverVersion}@{CPO version}
+	shareProto string
+	clusterID  string
+
 	withTopology bool
-	name         string
-	fqVersion    string // Fully qualified version in format {driverVersion}@{CPO version}
-	shareProto   string
-	clusterID    string
 
 	serverEndpoint string
 	fwdEndpoint    string
-
-	compatOpts *options.CompatibilityOptions
 
 	ids *identityServer
 	cs  *controllerServer
@@ -77,6 +60,55 @@ type Driver struct {
 
 	manilaClientBuilder manilaclient.Builder
 	csiClientBuilder    csiclient.Builder
+
+	pvcLister v1.PersistentVolumeClaimLister
+}
+
+type DriverOpts struct {
+	DriverName string
+	ShareProto string
+	ClusterID  string
+
+	WithTopology bool
+
+	ServerCSIEndpoint string
+	FwdCSIEndpoint    string
+
+	NodeID string
+	NodeAZ string
+
+	ManilaClientBuilder manilaclient.Builder
+	CSIClientBuilder    csiclient.Builder
+
+	PVCLister v1.PersistentVolumeClaimLister
+}
+
+type staticMetadata struct {
+	nodeID string
+	nodeAZ string
+}
+
+func (m *staticMetadata) GetInstanceID() (string, error)       { return m.nodeID, nil }
+func (m *staticMetadata) GetAvailabilityZone() (string, error) { return m.nodeAZ, nil }
+
+type overrideMetadata struct {
+	nodeID   string
+	nodeAZ   string
+	fallback metadata.IMetadata
+}
+
+func (m *overrideMetadata) GetInstanceID() (string, error) {
+	if m.nodeID != "" {
+		return m.nodeID, nil
+	}
+	return m.fallback.GetInstanceID()
+}
+
+func (m *overrideMetadata) GetAvailabilityZone() (string, error) {
+	if m.nodeAZ != "" {
+		return m.nodeAZ, nil
+	}
+	return m.fallback.GetAvailabilityZone()
 }
 
 type nonBlockingGRPCServer struct {
@@ -85,7 +117,7 @@ type nonBlockingGRPCServer struct {
 }
 
 const (
-	specVersion   = "1.2.0"
+	specVersion   = "1.8.0"
 	driverVersion = "0.9.0"
 	topologyKey   = "topology.manila.csi.openstack.org/zone"
 )
@@ -103,7 +135,13 @@ func argNotEmpty(val, name string) error {
 }
 
 func NewDriver(o *DriverOpts) (*Driver, error) {
-	for k, v := range map[string]string{"node ID": o.NodeID, "driver name": o.DriverName, "driver endpoint": o.ServerCSIEndpoint, "FWD endpoint": o.FwdCSIEndpoint, "share protocol selector": o.ShareProto} {
+	m := map[string]string{
+		"driver name":             o.DriverName,
+		"driver endpoint":         o.ServerCSIEndpoint,
+		"FWD endpoint":            o.FwdCSIEndpoint,
+		"share protocol selector": o.ShareProto,
+	}
+	for k, v := range m {
 		if err := argNotEmpty(v, k); err != nil {
 			return nil, err
 		}
@@ -111,31 +149,24 @@ func NewDriver(o *DriverOpts) (*Driver, error) {
 
 	d := &Driver{
 		fqVersion:           fmt.Sprintf("%s@%s", driverVersion, version.Version),
-		nodeID:              o.NodeID,
-		nodeAZ:              o.NodeAZ,
 		withTopology:        o.WithTopology,
 		name:                o.DriverName,
 		serverEndpoint:      o.ServerCSIEndpoint,
 		fwdEndpoint:         o.FwdCSIEndpoint,
 		shareProto:          strings.ToUpper(o.ShareProto),
-		compatOpts:          o.CompatOpts,
 		manilaClientBuilder: o.ManilaClientBuilder,
 		csiClientBuilder:    o.CSIClientBuilder,
 		clusterID:           o.ClusterID,
+		pvcLister:           o.PVCLister,
 	}
 
 	klog.Info("Driver: ", d.name)
 	klog.Info("Driver version: ", d.fqVersion)
 	klog.Info("CSI spec version: ", specVersion)
+	klog.Infof("Topology awareness: %t", d.withTopology)
 
 	getShareAdapter(d.shareProto) // The program will terminate with a non-zero exit code if the share protocol selector is wrong
 	klog.Infof("Operating on %s shares", d.shareProto)
-
-	if d.withTopology {
-		klog.Infof("Topology awareness enabled, node availability zone: %s", d.nodeAZ)
-	} else {
-		klog.Info("Topology awareness disabled")
-	}
 
 	serverProto, serverAddr, err := parseGRPCEndpoint(o.ServerCSIEndpoint)
 	if err != nil {
@@ -150,9 +181,18 @@ func NewDriver(o *DriverOpts) (*Driver, error) {
 	d.serverEndpoint = endpointAddress(serverProto, serverAddr)
 	d.fwdEndpoint = endpointAddress(fwdProto, fwdAddr)
 
+	d.ids = &identityServer{d: d}
+
+	return d, nil
+}
+
+func (d *Driver) SetupControllerService() error {
+	klog.Info("Providing controller service")
+
 	d.addControllerServiceCapabilities([]csi.ControllerServiceCapability_RPC_Type{
 		csi.ControllerServiceCapability_RPC_CREATE_DELETE_VOLUME,
 		csi.ControllerServiceCapability_RPC_CREATE_DELETE_SNAPSHOT,
+		csi.ControllerServiceCapability_RPC_EXPAND_VOLUME,
 	})
 
 	d.addVolumeCapabilityAccessModes([]csi.VolumeCapability_AccessMode_Mode{
@@ -163,13 +203,30 @@ func NewDriver(o *DriverOpts) (*Driver, error) {
 		csi.VolumeCapability_AccessMode_SINGLE_NODE_READER_ONLY,
 	})
 
+	d.cs = &controllerServer{d: d}
+	return nil
+}
+
+func (d *Driver) SetupNodeService(nodeID, nodeAZ string, md metadata.IMetadata) error {
+	klog.Info("Providing node service")
+
+	var effectiveMD metadata.IMetadata
+	switch {
+	case nodeID != "" && nodeAZ != "":
+		effectiveMD = &staticMetadata{nodeID: nodeID, nodeAZ: nodeAZ}
+	case nodeID != "" || nodeAZ != "":
+		effectiveMD = &overrideMetadata{nodeID: nodeID, nodeAZ: nodeAZ, fallback: md}
+	default:
+		effectiveMD = md
+	}
+
 	var supportsNodeStage bool
 
 	nodeCapsMap, err := d.initProxiedDriver()
 	if err != nil {
-		return nil, fmt.Errorf("failed to initialize proxied CSI driver: %v", err)
+		return fmt.Errorf("failed to initialize proxied CSI driver: %v", err)
 	}
-	var nscaps []csi.NodeServiceCapability_RPC_Type
+	nscaps := make([]csi.NodeServiceCapability_RPC_Type, 0, len(nodeCapsMap))
 	for c := range nodeCapsMap {
 		nscaps = append(nscaps, c)
 
@@ -180,21 +237,27 @@ func NewDriver(o *DriverOpts) (*Driver, error) {
 
 	d.addNodeServiceCapabilities(nscaps)
 
-	d.ids = &identityServer{d: d}
-	d.cs = &controllerServer{d: d}
-	d.ns = &nodeServer{d: d, supportsNodeStage: supportsNodeStage, nodeStageCache: make(map[volumeID]stageCacheEntry)}
-
-	return d, nil
+	d.ns = &nodeServer{
+		d:                 d,
+		metadata:          effectiveMD,
+		supportsNodeStage: supportsNodeStage,
+		nodeStageCache:    make(map[volumeID]stageCacheEntry),
+	}
+	return nil
 }
 
 func (d *Driver) Run() {
+	if nil == d.cs && nil == d.ns {
+		klog.Fatal("No CSI services initialized")
+	}
+
 	s := nonBlockingGRPCServer{}
 	s.start(d.serverEndpoint, d.ids, d.cs, d.ns)
 	s.wait()
 }
 
 func (d *Driver) addControllerServiceCapabilities(cs []csi.ControllerServiceCapability_RPC_Type) {
-	var caps []*csi.ControllerServiceCapability
+	caps := make([]*csi.ControllerServiceCapability, 0, len(cs))
 
 	for _, c := range cs {
 		klog.Infof("Enabling controller service capability: %v", c.String())
@@ -213,7 +276,7 @@ func (d *Driver) addControllerServiceCapabilities(cs []csi.ControllerServiceCapa
 }
 
 func (d *Driver) addVolumeCapabilityAccessModes(vs []csi.VolumeCapability_AccessMode_Mode) {
-	var caps []*csi.VolumeCapability_AccessMode
+	caps := make([]*csi.VolumeCapability_AccessMode, 0, len(vs))
 
 	for _, c := range vs {
 		klog.Infof("Enabling volume access mode: %v", c.String())
@@ -224,7 +287,7 @@ func (d *Driver) addVolumeCapabilityAccessModes(vs []csi.VolumeCapability_Access
 }
 
 func (d *Driver) addNodeServiceCapabilities(ns []csi.NodeServiceCapability_RPC_Type) {
-	var caps []*csi.NodeServiceCapability
+	caps := make([]*csi.NodeServiceCapability, 0, len(ns))
 
 	for _, c := range ns {
 		klog.Infof("Enabling node service capability: %v", c.String())
@@ -249,14 +312,27 @@ func (d *Driver) initProxiedDriver() (csiNodeCapabilitySet, error) {
 	}
 	defer conn.Close()
 
-	identityClient := d.csiClientBuilder.NewIdentityServiceClient(conn)
-
-	if err = identityClient.ProbeForever(conn, time.Second*5); err != nil {
-		return nil, fmt.Errorf("probe failed: %v", err)
-	}
-
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second*15)
 	defer cancel()
+
+	identityClient := d.csiClientBuilder.NewIdentityServiceClient(conn)
+
+	for {
+		if err = identityClient.ProbeForever(ctx, conn, time.Second*5); err == nil {
+			break
+		}
+		if status.Code(err) != codes.Unavailable {
+			return nil, fmt.Errorf("probe failed: %v", err)
+		}
+		klog.Warningf("proxied CSI driver probe returned Unavailable for %s, retrying: %v", d.fwdEndpoint, err)
+		select {
+		case <-ctx.Done():
+		case <-time.After(time.Second):
+		}
+		if ctx.Err() != nil {
+			return nil, fmt.Errorf("timed out probing proxied CSI driver %s: %v", d.fwdEndpoint, err)
+		}
+	}
 
 	pluginInfo, err := identityClient.GetPluginInfo(ctx)
 	if err != nil {
@@ -282,15 +358,9 @@ func (s *nonBlockingGRPCServer) wait() {
 	s.wg.Wait()
 }
 
-func (s *nonBlockingGRPCServer) stop() {
-	s.server.GracefulStop()
-}
-
-func (s *nonBlockingGRPCServer) forceStop() {
-	s.server.Stop()
-}
-
 func (s *nonBlockingGRPCServer) serve(endpoint string, ids *identityServer, cs *controllerServer, ns *nodeServer) {
+	defer s.wg.Done()
+
 	proto, addr, err := parseGRPCEndpoint(endpoint)
 	if err != nil {
 		klog.Fatalf("couldn't parse GRPC server endpoint address %s: %v", endpoint, err)
@@ -323,9 +393,15 @@ func (s *nonBlockingGRPCServer) serve(endpoint string, ids *identityServer, cs *
 
 	s.server = server
 
-	csi.RegisterIdentityServer(server, ids)
-	csi.RegisterControllerServer(server, cs)
-	csi.RegisterNodeServer(server, ns)
+	if ids != nil {
+		csi.RegisterIdentityServer(server, ids)
+	}
+	if cs != nil {
+		csi.RegisterControllerServer(server, cs)
+	}
+	if ns != nil {
+		csi.RegisterNodeServer(server, ns)
+	}
 
 	klog.Infof("listening for connections on %#v", listener.Addr())
 

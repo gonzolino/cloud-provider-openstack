@@ -19,6 +19,7 @@ package validator
 import (
 	"fmt"
 	"reflect"
+	"strconv"
 )
 
 // Validator validates input data and stores it in the output struct.
@@ -28,25 +29,28 @@ import (
 // By default, the input data has to contain a value for each struct field.
 //
 // Available tags:
-// * name:"FIELD-NAME" : key of the value in the input map
-// * value: modifies value requirements:
-//   value:"required" : field is required
-//   value:"optional" : field is optional
-//   value:"requiredIf:FIELD-NAME=REGEXP-PATTERN" : field is required if the value of FIELD-NAME matches REGEXP-PATTERN
-//   value:"optionalIf:FIELD-NAME=REGEXP-PATTERN" : field is optional if the value of FIELD-NAME matches REGEXP-PATTERN
-//   value:"default:VALUE" : field value defaults to VALUE
-// * dependsOn:"FIELD-NAMES|,..." : if this field is not empty, the specified fields are required to be present
-//   operator ',' acts as AND
-//   operator '|' acts as XOR
-//   e.g.: dependsOn:"f1|f2|f3,f4,f5" : if this field is not empty, exactly one of {f1,f2,f3} is required to be present,
-//         and f4 and f5 is required to be present
-// * precludes:"FIELD-NAMES,..." : if this field is not empty, all specified fields are required to be empty
-// * matches:"REGEXP-PATTERN" : if this field is not empty, it's required to match REGEXP-PATTERN
+//   - name:"FIELD-NAME" : key of the value in the input map
+//   - value: modifies value requirements:
+//     value:"required" : field is required
+//     value:"optional" : field is optional
+//     value:"requiredIf:FIELD-NAME=REGEXP-PATTERN" : field is required if the value of FIELD-NAME matches REGEXP-PATTERN
+//     value:"optionalIf:FIELD-NAME=REGEXP-PATTERN" : field is optional if the value of FIELD-NAME matches REGEXP-PATTERN
+//     value:"default:VALUE" : field value defaults to VALUE
+//   - dependsOn:"FIELD-NAMES|,..." : if this field is not empty, the specified fields are required to be present
+//     operator ',' acts as AND
+//     operator '|' acts as XOR
+//     e.g.: dependsOn:"f1|f2|f3,f4,f5" : if this field is not empty, exactly one of {f1,f2,f3} is required to be present,
+//     and f4 and f5 is required to be present
+//   - precludes:"FIELD-NAMES,..." : if this field is not empty, all specified fields are required to be empty
+//   - matches:"REGEXP-PATTERN" : if this field is not empty, it's required to match REGEXP-PATTERN
 type Validator struct {
 	t reflect.Type
 
 	nameIdxMap nameIndexMap
 	idxNameMap indexNameMap
+
+	// Field names in the struct.
+	Fields []string
 
 	valueExprs *valueExpressions
 	depsMap    dependenciesMap
@@ -67,11 +71,21 @@ func New(stringStruct interface{}) *Validator {
 		t:          t,
 		nameIdxMap: nameIdxMap,
 		idxNameMap: idxNameMap,
+		Fields:     buildFieldNames(idxNameMap),
 		valueExprs: buildValueExpressions(t, idxNameMap, nameIdxMap),
 		depsMap:    buildDependenciesMap(t, idxNameMap, nameIdxMap),
 		preclsMap:  buildPreclusionsMap(t, idxNameMap, nameIdxMap),
 		matchMap:   buildMatchRegexMap(t),
 	}
+}
+
+func buildFieldNames(m indexNameMap) []string {
+	s := make([]string, 0, len(m))
+	for _, fieldName := range m {
+		s = append(s, string(fieldName))
+	}
+
+	return s
 }
 
 // Populate validates input data and populates the output struct.
@@ -100,10 +114,24 @@ func (v *Validator) Populate(data map[string]string, out interface{}) error {
 				return fmt.Errorf("parameter '%s' cannot be empty", fName)
 			}
 
-			// The value is present, populate the field and continue with the next one
+			field := vOut.Field(int(fIdx))
 
-			vOut.Field(int(fIdx)).SetString(value)
-			continue
+			switch field.Kind() {
+			case reflect.Bool:
+				boolValue, err := strconv.ParseBool(value)
+				if err != nil {
+					return fmt.Errorf("invalid boolean value for parameter '%s': %v", fName, err)
+				}
+				field.SetBool(boolValue)
+				continue
+
+			case reflect.String:
+				field.SetString(value)
+				continue
+
+			default:
+				return fmt.Errorf("unsupported field type for parameter '%s'", fName)
+			}
 		}
 
 		// Value not present, determine whether this field is required

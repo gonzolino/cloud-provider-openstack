@@ -17,21 +17,22 @@ limitations under the License.
 package main
 
 import (
-	"flag"
+	"context"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"time"
 
-	"github.com/gophercloud/gophercloud"
-	"github.com/gophercloud/utils/openstack/clientconfig"
-	"github.com/spf13/pflag"
+	"github.com/gophercloud/gophercloud/v2"
+	"github.com/gophercloud/utils/v2/openstack/clientconfig"
+	"github.com/spf13/cobra"
+	"k8s.io/component-base/cli"
 
-	"golang.org/x/crypto/ssh/terminal"
+	"golang.org/x/term"
 
 	"k8s.io/cloud-provider-openstack/pkg/identity/keystone"
-	kflag "k8s.io/component-base/cli/flag"
-	"k8s.io/klog/v2"
+	"k8s.io/cloud-provider-openstack/pkg/version"
 )
 
 const errRespTemplate string = `{
@@ -57,7 +58,7 @@ func promptForString(field string, r io.Reader, show bool) (result string, err e
 		_, err = fmt.Fscan(r, &result)
 	} else {
 		var data []byte
-		data, err = terminal.ReadPassword(int(os.Stdin.Fd()))
+		data, err = term.ReadPassword(int(os.Stdin.Fd()))
 		result = string(data)
 		fmt.Fprintf(os.Stderr, "\n")
 	}
@@ -135,55 +136,53 @@ func argumentsAreSet(url, user, project, password, domain, applicationCredential
 	return false
 }
 
+var (
+	url                         string
+	domain                      string
+	user                        string
+	project                     string
+	password                    string
+	clientCertPath              string
+	clientKeyPath               string
+	clientCAPath                string
+	options                     keystone.Options
+	err                         error
+	applicationCredentialID     string
+	applicationCredentialName   string
+	applicationCredentialSecret string
+)
+
 func main() {
-	// Glog requires this otherwise it complains.
-	flag.CommandLine.Parse(nil)
-	// This is a temporary hack to enable proper logging until upstream dependencies
-	// are migrated to fully utilize klog instead of glog.
-	klogFlags := flag.NewFlagSet("klog", flag.ExitOnError)
-	klog.InitFlags(klogFlags)
+	cmd := &cobra.Command{
+		Use:   "client-keystone-auth",
+		Short: "Keystone client credential plugin for Kubernetes",
+		Run: func(cmd *cobra.Command, args []string) {
+			handle(context.Background())
+		},
+		Version: version.Version,
+	}
 
-	// Sync the glog and klog flags.
-	flag.CommandLine.VisitAll(func(f1 *flag.Flag) {
-		f2 := klogFlags.Lookup(f1.Name)
-		if f2 != nil {
-			value := f1.Value.String()
-			f2.Value.Set(value)
-		}
-	})
+	cmd.PersistentFlags().StringVar(&url, "keystone-url", os.Getenv("OS_AUTH_URL"), "URL for the OpenStack Keystone API")
+	cmd.PersistentFlags().StringVar(&domain, "domain-name", os.Getenv("OS_DOMAIN_NAME"), "Keystone domain name")
+	cmd.PersistentFlags().StringVar(&user, "user-name", os.Getenv("OS_USERNAME"), "User name")
+	cmd.PersistentFlags().StringVar(&project, "project-name", os.Getenv("OS_PROJECT_NAME"), "Keystone project name")
+	cmd.PersistentFlags().StringVar(&password, "password", os.Getenv("OS_PASSWORD"), "Password")
+	cmd.PersistentFlags().StringVar(&clientCertPath, "cert", os.Getenv("OS_CERT"), "Client certificate bundle file")
+	cmd.PersistentFlags().StringVar(&clientKeyPath, "key", os.Getenv("OS_KEY"), "Client certificate key file")
+	cmd.PersistentFlags().StringVar(&clientCAPath, "cacert", os.Getenv("OS_CACERT"), "Certificate authority file")
+	cmd.PersistentFlags().StringVar(&applicationCredentialID, "application-credential-id", os.Getenv("OS_APPLICATION_CREDENTIAL_ID"), "Application Credential ID")
+	cmd.PersistentFlags().StringVar(&applicationCredentialName, "application-credential-name", os.Getenv("OS_APPLICATION_CREDENTIAL_NAME"), "Application Credential Name")
+	cmd.PersistentFlags().StringVar(&applicationCredentialSecret, "application-credential-secret", os.Getenv("OS_APPLICATION_CREDENTIAL_SECRET"), "Application Credential Secret")
 
-	var url string
-	var domain string
-	var user string
-	var project string
-	var password string
-	var clientCertPath string
-	var clientKeyPath string
-	var clientCAPath string
-	var options keystone.Options
-	var err error
-	var applicationCredentialID string
-	var applicationCredentialName string
-	var applicationCredentialSecret string
+	code := cli.Run(cmd)
+	os.Exit(code)
+}
 
-	pflag.StringVar(&url, "keystone-url", os.Getenv("OS_AUTH_URL"), "URL for the OpenStack Keystone API")
-	pflag.StringVar(&domain, "domain-name", os.Getenv("OS_DOMAIN_NAME"), "Keystone domain name")
-	pflag.StringVar(&user, "user-name", os.Getenv("OS_USERNAME"), "User name")
-	pflag.StringVar(&project, "project-name", os.Getenv("OS_PROJECT_NAME"), "Keystone project name")
-	pflag.StringVar(&password, "password", os.Getenv("OS_PASSWORD"), "Password")
-	pflag.StringVar(&clientCertPath, "cert", os.Getenv("OS_CERT"), "Client certificate bundle file")
-	pflag.StringVar(&clientKeyPath, "key", os.Getenv("OS_KEY"), "Client certificate key file")
-	pflag.StringVar(&clientCAPath, "cacert", os.Getenv("OS_CACERT"), "Certificate authority file")
-	pflag.StringVar(&applicationCredentialID, "application-credential-id", os.Getenv("OS_APPLICATION_CREDENTIAL_ID"), "Application Credential ID")
-	pflag.StringVar(&applicationCredentialName, "application-credential-name", os.Getenv("OS_APPLICATION_CREDENTIAL_NAME"), "Application Credential Name")
-	pflag.StringVar(&applicationCredentialSecret, "application-credential-secret", os.Getenv("OS_APPLICATION_CREDENTIAL_SECRET"), "Application Credential Secret")
-	pflag.CommandLine.AddGoFlagSet(klogFlags)
-	kflag.InitFlags()
-
+func handle(ctx context.Context) {
 	// Generate Gophercloud Auth Options based on input data from stdin
 	// if IsTerminal returns "true", or from env variables otherwise.
-	if !terminal.IsTerminal(int(os.Stdin.Fd())) {
-		// If all requiered arguments are set use them
+	if !term.IsTerminal(int(os.Stdin.Fd())) {
+		// If all required arguments are set use them
 		if argumentsAreSet(url, user, project, password, domain, applicationCredentialID, applicationCredentialName, applicationCredentialSecret) {
 			options.AuthOptions = gophercloud.AuthOptions{
 				IdentityEndpoint:            url,
@@ -216,9 +215,9 @@ func main() {
 	options.ClientKeyPath = clientKeyPath
 	options.ClientCAPath = clientCAPath
 
-	token, err := keystone.GetToken(options)
+	token, err := keystone.GetToken(ctx, options)
 	if err != nil {
-		if _, ok := err.(gophercloud.ErrDefault401); ok {
+		if gophercloud.ResponseCodeIs(err, http.StatusUnauthorized) {
 			fmt.Println(errRespTemplate)
 			os.Stderr.WriteString("Invalid user credentials were provided\n")
 			os.Exit(0)

@@ -11,10 +11,20 @@ metadata:
 spec:
   containers:
     - name: openstack-cloud-controller-manager
-      image: docker.io/k8scloudprovider/openstack-cloud-controller-manager:latest
+      securityContext:
+        capabilities:
+          drop:
+            - ALL
+        readOnlyRootFilesystem: true
+        seccompProfile:
+          type: RuntimeDefault
+        allowPrivilegeEscalation: false
+        runAsNonRoot: true
+      image: registry.k8s.io/provider-os/openstack-cloud-controller-manager:v1.38.0
       args:
         - /bin/openstack-cloud-controller-manager
         - --v=1
+        - --cluster-name=$(CLUSTER_NAME)
         - --cloud-config=$(CLOUD_CONFIG)
         - --cloud-provider=openstack
         - --use-service-account-credentials=true
@@ -35,9 +45,19 @@ spec:
       env:
         - name: CLOUD_CONFIG
           value: /etc/config/cloud.conf
+        - name: CLUSTER_NAME
+          value: kubernetes
+  # ClusterFirst uses node DNS with hostNetwork, allowing OCCM to bootstrap.
+  dnsPolicy: ClusterFirst
+  # Host network access is usually necessary if using metadata service,
+  # since not all CNIs support link-local addresses, or if the OpenStack
+  # control plane is on a management network that is not advertised to pods
   hostNetwork: true
+  priorityClassName: system-cluster-critical
   securityContext:
     runAsUser: 1001
+    seccompProfile:
+      type: RuntimeDefault
   volumes:
   - hostPath:
       path: /etc/kubernetes/pki

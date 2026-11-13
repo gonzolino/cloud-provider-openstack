@@ -13,16 +13,21 @@ Create chart name and version as used by the chart label.
 {{- end -}}
 
 {{/*
-Common labels and app labels
+Standard Kubernetes recommended labels.
 */}}
-{{- define "occm.labels" -}}
-app.kubernetes.io/name: {{ include "occm.name" . }}
+{{- define "occm.labels.standard" -}}
 helm.sh/chart: {{ include "occm.chart" . }}
+app.kubernetes.io/name: {{ include "occm.name" . }}
 app.kubernetes.io/instance: {{ .Release.Name }}
 {{- if .Chart.AppVersion }}
 app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
 {{- end }}
 app.kubernetes.io/managed-by: {{ .Release.Service }}
+{{- end -}}
+
+{{- define "occm.labels.matchLabels" -}}
+app.kubernetes.io/name: {{ include "occm.name" . }}
+app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end -}}
 
 {{- define "occm.common.matchLabels" -}}
@@ -43,7 +48,23 @@ component: controllermanager
 {{- define "occm.controllermanager.labels" -}}
 {{ include "occm.controllermanager.matchLabels" . }}
 {{ include "occm.common.metaLabels" . }}
+{{ if .Values.podLabels }}
+{{- toYaml .Values.podLabels }}
+{{- end }}
 {{- end -}}
+
+{{/*
+Common annotations and pod annotations
+*/}}
+{{- define "occm.controllermanager.annotations" -}}
+{{- if .Values.commonAnnotations }}
+{{- toYaml .Values.commonAnnotations }}
+{{- end }}
+{{ if .Values.podAnnotations }}
+{{- toYaml .Values.podAnnotations }}
+{{- end }}
+{{- end -}}
+
 
 {{/*
 Create cloud-config makro.
@@ -51,26 +72,38 @@ Create cloud-config makro.
 {{- define "cloudConfig" -}}
 [Global]
 {{- range $key, $value := .Values.cloudConfig.global }}
-{{ $key }} = {{ $value }}
+{{ $key }} = {{ $value | quote }}
 {{- end }}
 
 [Networking]
 {{- range $key, $value := .Values.cloudConfig.networking }}
-{{ $key }} = {{ $value }}
+{{ $key }} = {{ $value | quote }}
 {{- end }}
 
 [LoadBalancer]
 {{- range $key, $value := .Values.cloudConfig.loadBalancer }}
-{{ $key }} = {{ $value }}
+{{ $key }} = {{ $value | quote }}
 {{- end }}
 
 [BlockStorage]
 {{- range $key, $value := .Values.cloudConfig.blockStorage }}
-{{ $key }} = {{ $value }}
+{{ $key }} = {{ $value | quote }}
 {{- end }}
 
 [Metadata]
 {{- range $key, $value := .Values.cloudConfig.metadata }}
-{{ $key }} = {{ $value }}
+{{ $key }} = {{ $value | quote }}
 {{- end }}
+
+[Route]
+{{- range $key, $value := .Values.cloudConfig.route }}
+{{ $key }} = {{ $value | quote }}
+{{- end }}
+{{- end }}
+
+{{/*
+Generate string of enabled controllers. Might have a trailing comma (,) which needs to be trimmed.
+*/}}
+{{- define "occm.enabledControllers" }}
+{{- range .Values.enabledControllers -}}{{ . }},{{- end -}}
 {{- end }}

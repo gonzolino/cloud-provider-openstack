@@ -14,6 +14,8 @@
     - [Create a backend service](#create-a-backend-service)
     - [Create an Ingress resource](#create-an-ingress-resource)
   - [Enable TLS encryption](#enable-tls-encryption)
+  - [Allow CIDRs](#allow-cidrs)
+  - [Creating Ingress by specifying a floating IP](#creating-ingress-by-specifying-a-floating-ip)
 
 <!-- END doctoc generated TOC please keep comment here to allow auto update -->
 
@@ -139,15 +141,38 @@ Here are several other config options are not included in the example configurat
 
     Notes for the security group:
 
-    - The security group name is in the format: `k8s_ing_<cluster-name>_<ingress-namespace>_<ingress-name>`
+    - The security group name is in the format: `kube_ingress_<cluster-name>_<ingress-namespace>_<ingress-name>`
     - The security group description is in the format: `Security group created for Ingress <ingress-namespace>/<ingress-name> from cluster <cluster-name>`
     - The security group has tags: `["octavia.ingress.kubernetes.io", "<ingress-namespace>_<ingress-name>"]`
     - The security group is associated with all the Neutron ports of the Kubernetes worker nodes. 
 
+- Options to select a flavor id. The octavia-ingress-controller will use that flavor to create the Octavia load balancer. If not specified, the default flavor will be used.
+
+    ```yaml
+    octavia:
+      flavor-id: a07528cf-4a99-4f8a-94de-691e0b3e2076
+    ```
+
+- Option to set which Octavia provider to use. If unset octavia-ingress-controller will leave it unset so the load balancers will be created with the default provider configured for that OpenStack cloud, decided by the cloud administrator. You can use `openstack loadbalancer provider list` to check available Octavia providers. Please note that currently only Amphora provider is supporting all the features required for octavia-ingress-controller to work correctly. That provider can be named differently in the cloud you use.
+
+    ```yaml
+    octavia:
+      provider: amphora
+    ```
+
+- Option to specify that the Octavia provider does not support creating fully-populated loadbalancers using a single [API
+  call](https://docs.openstack.org/api-ref/load-balancer/v2/?expanded=create-a-load-balancer-detail#creating-a-fully-populated-load-balancer).
+  Setting this option to true will create loadbalancers using serial API calls which first create an unpopulated
+  loadbalancer, then populate its listeners, pools and members. This is a compatibility option at the expense of
+  increased load on the OpenStack API.
+    ```yaml
+    octavia:
+      provider-requires-serial-api-calls: true
+    ```
 ### Deploy octavia-ingress-controller
 
 ```shell
-image="docker.io/k8scloudprovider/octavia-ingress-controller:latest"
+image="registry.k8s.io/provider-os/octavia-ingress-controller:v1.38.0"
 
 cat <<EOF > /etc/kubernetes/octavia-ingress-controller/deployment.yaml
 ---
@@ -380,7 +405,7 @@ Ingress and enable the more secure HTTPS protocol.
             # Any image is permissible as long as:
             # 1. It serves a 404 page at /
             # 2. It serves 200 on a /healthz endpoint
-            image: k8s.gcr.io/defaultbackend-amd64:1.5
+            image: registry.k8s.io/defaultbackend-amd64:1.5
             ports:
             - containerPort: 8080
     ---
@@ -449,3 +474,81 @@ Ingress and enable the more secure HTTPS protocol.
 > NOTE: octavia-ingress-controller currently doesn't support to integrate with
 > `cert-manager` to create the non-existing secret dynamically. Could be improved
 > in the future.
+
+## Allow CIDRs
+
+By using the annotation `octavia.ingress.kubernetes.io/whitelist-source-range`,
+you can restrict access to certain IP addresses.
+The value should be a comma-separated list of CIDRs.
+
+Example:
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: test-octavia-ingress
+  annotations:
+    kubernetes.io/ingress.class: "openstack"
+    octavia.ingress.kubernetes.io/internal: "false"
+    octavia.ingress.kubernetes.io/whitelist-source-range: 192.168.1.0/23
+spec:
+  rules:
+    - host: foo.bar.com
+      http:
+        paths:
+        - path: /ping
+          pathType: Exact
+          backend:
+            service:
+              name: webserver
+              port:
+                number: 8080
+```
+
+## Creating Ingress by specifying a floating IP
+
+Sometimes it's useful to use an existing available floating IP rather than creating a new one, especially in the automation scenario. In the example below, 122.112.219.229 is an available floating IP created in the OpenStack Networking service.
+
+You can also specify to not delete the floating IP when the ingress will be deleted. By default, if not specified, the floating IP
+is deleted with the loadbalancer when the ingress if removed on kubernetes. 
+
+Create a new depolyment:
+```shell script
+kubectl create deployment test-web --replicas 3 --image nginx --port 80
+```
+
+Create a service type NodePort:
+```shell script
+kubectl expose deployment test-web --type NodePort
+```
+
+Create an ingress using a specific floating IP:
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: test-web-ingress
+  annotations:
+    kubernetes.io/ingress.class: "openstack"
+    octavia.ingress.kubernetes.io/internal: "false"
+    octavia.ingress.kubernetes.io/keep-floatingip: "true"        # floating ip will not be deleted when ingress is deleted
+    octavia.ingress.kubernetes.io/floatingip: "122.112.219.229"  # define the floating to use 
+spec:
+  rules:
+  - host: test-web.foo.bar.com
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: test-web
+            port:
+              number: 80
+```
+
+If the floating IP is available you can test it with:
+```shell script
+curl -H "host: test-web.foo.bar.com" http://122.112.219.229
+```

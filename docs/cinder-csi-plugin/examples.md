@@ -8,17 +8,19 @@
   - [Volume Expansion Example](#volume-expansion-example)
   - [Using Block Volume](#using-block-volume)
   - [Snapshot Create and Restore](#snapshot-create-and-restore)
+  - [Use Topology](#use-topology)
   - [Disaster recovery of PV and PVC](#disaster-recovery-of-pv-and-pvc)
+  - [Use scheduler hints annotations](#use-scheduler-hints-annotations)
 
 <!-- END doctoc generated TOC please keep comment here to allow auto update -->
 
 # Cinder CSI Driver Usage Examples
 
-All following examples need to be used inside instance(s) provisoned by openstack, otherwise the attach action will fail due to fail to find instance ID from given openstack cloud.
+All following examples need to be used inside instance(s) provisioned by openstack, otherwise the attach action will fail due to fail to find instance ID from given openstack cloud.
 
 ## Dynamic Volume Provisioning
 
-For dynamic provisoning , create StorageClass, PersistentVolumeClaim and pod to consume it. 
+For dynamic provisioning , create StorageClass, PersistentVolumeClaim and pod to consume it. 
 Checkout [sample app](../../examples/cinder-csi-plugin/nginx.yaml) definition fore reference.
 
 ```kubectl -f examples/cinder-csi-plugin/nginx.yaml create```
@@ -100,16 +102,18 @@ $ mount /dev/vdb /mnt; ls /mnt
 index.html  lost+found
 ```
 
-## Deploy app using Inline volumes
+## Deploy app using ephemeral volumes
 
-Sample App definition on using Inline volumes can be found at [here](../../examples/cinder-csi-plugin/inline/inline-example.yaml)
+### CSI Ephemeral Volumes
+
+Sample App definition on using CSI ephemeral volumes can be found at [here](../../examples/cinder-csi-plugin/ephemeral/csi-ephemeral-volumes-example.yaml)
 
 Prerequisites:
 * Deploy CSI Driver, with both volumeLifecycleModes enabled as specified [here](../../manifests/cinder-csi-plugin/csi-cinder-driver.yaml)
 
 Create a pod with inline volume
 ```
-$ kubectl create -f examples/cinder-csi-plugin/inline/inline-example.yaml
+$ kubectl create -f examples/cinder-csi-plugin/ephemeral/csi-ephemeral-volumes-example.yaml
 ```
 Get the pod description, verify created volume in Volumes section.
 ```
@@ -127,6 +131,43 @@ Volumes:
     SecretName:  default-token-dn78p
     Optional:    false
 
+```
+
+### Generic Ephemeral Volumes
+
+Sample App definition on using generic ephemeral volumes can be found at [here](../../examples/cinder-csi-plugin/ephemeral/generic-ephemeral-volumes.yaml)
+
+Create a pod with ephemeral volume and storage class
+
+```
+# kubectl create -f examples/cinder-csi-plugin/ephemeral/generic-ephemeral-volumes.yaml
+storageclass.storage.k8s.io/scratch-storage-class created
+pod/ephemeral-example created
+``` 
+
+```
+# kubectl get pods -A
+NAMESPACE     NAME                                                          READY   STATUS    RESTARTS   AGE
+default       ephemeral-example                                             1/1     Running   0          28s
+```
+
+we can find pv/pvc/volumes created just like general volume.
+
+```
+# kubectl get pvc
+NAME                               STATUS   VOLUME                                     CAPACITY   ACCESS MODES   STORAGECLASS            AGE
+ephemeral-example-scratch-volume   Bound    pvc-9848ed86-8aa1-439b-9839-9ceba6e6f653   1Gi        RWO            scratch-storage-class   32s
+
+# kubectl get pv
+NAME                                       CAPACITY   ACCESS MODES   RECLAIM POLICY   STATUS   CLAIM                                      STORAGECLASS            REASON   AGE
+pvc-9848ed86-8aa1-439b-9839-9ceba6e6f653   1Gi        RWO            Delete           Bound    default/ephemeral-example-scratch-volume   scratch-storage-class            35s
+
+# cinder list
++--------------------------------------+-----------+------------------------------------------+------+-------------+----------+--------------------------------------+
+| ID                                   | Status    | Name                                     | Size | Volume Type | Bootable | Attached to                          |
++--------------------------------------+-----------+------------------------------------------+------+-------------+----------+--------------------------------------+
+| 7f4a09de-a8a9-4b89-9b70-d01028fcb789 | in-use    | pvc-9848ed86-8aa1-439b-9839-9ceba6e6f653 | 1    | lvmdriver-1 | false    | d438644c-864e-4b36-8a6e-794d35902f97 |
++--------------------------------------+-----------+------------------------------------------+------+-------------+----------+--------------------------------------+
 ```
 
 ## Volume Expansion Example
@@ -256,6 +297,61 @@ $ openstack volume list
 | bf8f9ae9-87b4-42bb-b74c-ba4645634be6 | pvc-4699fa78-4149-4772-b900-9536891fe200 | available |    1 |                                                 |
 ```
 
+## Use Topology
+
+Check [sample app](../../examples/cinder-csi-plugin/topology/example.yaml) for how to use Topology.
+
+Prerequisites:
+Deployed CSI and for CSI provisioner need make feature gate Topology enabled ("--feature-gates=Topology=true", which is by default True now)
+
+apply the example definition file:
+
+```
+$ kubectl apply -f example.yaml
+storageclass.storage.k8s.io/topology-aware-standard created
+persistentvolumeclaim/pvc1 created
+pod/app created
+```
+
+As the storageclass is looking for availability zone `nova1` through `topology.cinder.csi.openstack.org/zone=nova1` label,
+likely it will not be satisfied by default, so the pod and pvc are pending:
+
+```
+$ kubectl get pvc | grep pvc1
+pvc1                    Pending                                                                        topology-aware-standard   2m1s
+
+$ kubectl get pods app
+NAME   READY   STATUS    RESTARTS   AGE
+app    0/1     Pending   0          2m15s
+```
+
+This is because CSI cinder can't find a availability zone `nova1` so no volume can be created as `pv`.
+
+Now, edit the storageclass `topology-aware-standard` and updated the topology.cinder.csi.openstack.org/zone value from `nova1` to `nova`:
+
+```
+$ kubectl edit storageclass topology-aware-standard
+...
+allowedTopologies:
+- matchLabelExpressions:
+  - key: topology.cinder.csi.openstack.org/zone
+    values:
+    - nova
+...
+```
+
+The pod and pvc will be created. 
+```
+$ kubectl get pvc | grep pvc1
+pvc1                    Bound    pvc-c0a84f78-380f-4210-89df-8d616e9b99b6   1Gi        RWO            topology-aware-standard   4m44s
+
+$ kubectl get pods app
+NAME   READY   STATUS    RESTARTS   AGE
+app    1/1     Running   0          5m11s
+```
+
+Of course, A new availability zone `nova1` can be created in openstack side to satisfy the requirement as well.
+
 ## Disaster recovery of PV and PVC
 
 This example assume your Kubernetes cluster is crashed, but your volumes
@@ -358,3 +454,51 @@ spec:
   storageClassName: sata
   volumeMode: Filesystem
 ```
+
+## Use scheduler hints annotations
+
+Cinder CSI driver supports the use of scheduler hints to influence the
+placement of volumes. Scheduler hints can be specified in the
+PersistentVolumeClaim (PVC) annotations:
+
+* `cinder.csi.openstack.org/affinity`
+* `cinder.csi.openstack.org/anti-affinity`
+
+In order to use scheduler hints, the Cinder CSI controller plugin must be
+started with the `--pvc-annotations` flag. The PVC annotations take effect only
+when the PVC is created. The scheduler hints are not updated when the PVC is
+updated. The following example demonstrates how to use scheduler hints to
+influence the placement of volumes:
+
+```
+$ kubectl apply -f scheduler-hints-pvc.yaml
+```
+
+```
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: csi-pvc-cinderplugin
+  annotations:
+    cinder.csi.openstack.org/affinity: "1b4e28ba-2fa1-11ec-8d3d-0242ac130003"
+    cinder.csi.openstack.org/anti-affinity: "1b4e28ba-2fa1-11ec-8d3d-0242ac130004,pv-k8s--cluster-1b5f47bf-0119-442e-8529-254c36e43644"
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+  storageClassName: csi-sc-cinderplugin
+```
+
+where `1b4e28ba-2fa1-11ec-8d3d-0242ac130003`,
+`1b4e28ba-2fa1-11ec-8d3d-0242ac130004` and
+`pv-k8s--cluster-1b5f47bf-0119-442e-8529-254c36e43644` are names or UUIDs of
+the already provisioned volumes in the OpenStack cloud. The scheduler will try
+to place the volume in the same block storage server as the volume with the
+`1b4e28ba-2fa1-11ec-8d3d-0242ac130003` UUID and avoid placing the volume in the
+same block storage server as the volumes with the
+`1b4e28ba-2fa1-11ec-8d3d-0242ac130004` UUID and the
+`pv-k8s--cluster-1b5f47bf-0119-442e-8529-254c36e43644` volume name. If the
+scheduler hints are not satisfied, the volume will not be provisioned with an
+error message in the controller logs.

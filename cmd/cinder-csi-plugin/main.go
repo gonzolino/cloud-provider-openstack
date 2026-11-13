@@ -17,103 +17,191 @@ limitations under the License.
 package main
 
 import (
-	"flag"
 	"fmt"
 	"os"
 
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/cloud-provider-openstack/pkg/csi"
 	"k8s.io/cloud-provider-openstack/pkg/csi/cinder"
 	"k8s.io/cloud-provider-openstack/pkg/csi/cinder/openstack"
+	"k8s.io/cloud-provider-openstack/pkg/util/brick"
 	"k8s.io/cloud-provider-openstack/pkg/util/metadata"
 	"k8s.io/cloud-provider-openstack/pkg/util/mount"
-	"k8s.io/component-base/logs"
+	"k8s.io/cloud-provider-openstack/pkg/version"
+	"k8s.io/component-base/cli"
 	"k8s.io/klog/v2"
 )
 
 var (
-	endpoint    string
-	nodeID      string
-	cloudconfig string
-	cluster     string
+	endpoint                 string
+	nodeID                   string
+	cloudConfig              []string
+	cloudNames               []string
+	additionalTopologies     map[string]string
+	cluster                  string
+	httpEndpoint             string
+	provideControllerService bool
+	provideNodeService       bool
+	noClient                 bool
+	withTopology             bool
+	attachMode               string
 )
 
-func init() {
-	flag.Set("logtostderr", "true")
-}
-
 func main() {
-
-	flag.CommandLine.Parse([]string{})
-
 	cmd := &cobra.Command{
-		Use:   "Cinder",
+		Use:   "cinder-csi-plugin",
 		Short: "CSI based Cinder driver",
-		PersistentPreRun: func(cmd *cobra.Command, args []string) {
-			// Glog requires this otherwise it complains.
-			flag.CommandLine.Parse(nil)
-
-			// This is a temporary hack to enable proper logging until upstream dependencies
-			// are migrated to fully utilize klog instead of glog.
-			klogFlags := flag.NewFlagSet("klog", flag.ExitOnError)
-			klog.InitFlags(klogFlags)
-
-			// Sync the glog and klog flags.
-			cmd.Flags().VisitAll(func(f1 *pflag.Flag) {
-				f2 := klogFlags.Lookup(f1.Name)
-				if f2 != nil {
-					value := f1.Value.String()
-					f2.Value.Set(value)
-				}
-			})
-		},
 		Run: func(cmd *cobra.Command, args []string) {
 			handle()
 		},
+		PersistentPreRunE: func(cmd *cobra.Command, _ []string) error {
+			f := cmd.Flags()
+
+			if !provideControllerService {
+				return nil
+			}
+
+			configs, err := f.GetStringSlice("cloud-config")
+			if err != nil {
+				return err
+			}
+
+			if len(configs) == 0 {
+				return fmt.Errorf("unable to mark flag cloud-config to be required")
+			}
+
+			return nil
+		},
+		Version: version.Version,
 	}
 
-	cmd.Flags().AddGoFlagSet(flag.CommandLine)
+	csi.AddPVCFlags(cmd)
 
 	cmd.PersistentFlags().StringVar(&nodeID, "nodeid", "", "node id")
-	cmd.MarkPersistentFlagRequired("nodeid")
+	if err := cmd.PersistentFlags().MarkDeprecated("nodeid", "This option is now ignored by the driver. It will be removed in a future release."); err != nil {
+		klog.Fatalf("Unable to mark flag nodeid to be deprecated: %v", err)
+	}
 
 	cmd.PersistentFlags().StringVar(&endpoint, "endpoint", "", "CSI endpoint")
-	cmd.MarkPersistentFlagRequired("endpoint")
+	if err := cmd.MarkPersistentFlagRequired("endpoint"); err != nil {
+		klog.Fatalf("Unable to mark flag endpoint to be required: %v", err)
+	}
 
-	cmd.PersistentFlags().StringVar(&cloudconfig, "cloud-config", "", "CSI driver cloud config")
-	cmd.MarkPersistentFlagRequired("cloud-config")
+	cmd.Flags().StringSliceVar(&cloudConfig, "cloud-config", nil, "CSI driver cloud config. This option can be given multiple times")
+
+	cmd.PersistentFlags().BoolVar(&withTopology, "with-topology", true, "cluster is topology-aware")
+
+	cmd.PersistentFlags().StringSliceVar(&cloudNames, "cloud-name", []string{""}, "Cloud name to instruct CSI driver to read additional OpenStack cloud credentials from the configuration subsections. This option can be specified multiple times to manage multiple OpenStack clouds.")
+	cmd.PersistentFlags().StringToStringVar(&additionalTopologies, "additional-topology", map[string]string{}, "Additional CSI driver topology keys, for example topology.kubernetes.io/region=REGION1. This option can be specified multiple times to add multiple additional topology keys.")
 
 	cmd.PersistentFlags().StringVar(&cluster, "cluster", "", "The identifier of the cluster that the plugin is running in.")
+	cmd.PersistentFlags().StringVar(&httpEndpoint, "http-endpoint", "", "The TCP network address where the HTTP server for providing metrics for diagnostics, will listen (example: `:8080`). The default is empty string, which means the server is disabled.")
+
+	cmd.PersistentFlags().BoolVar(&provideControllerService, "provide-controller-service", true, "If set to true then the CSI driver does provide the controller service (default: true)")
+	cmd.PersistentFlags().BoolVar(&provideNodeService, "provide-node-service", true, "If set to true then the CSI driver does provide the node service (default: true)")
+	cmd.PersistentFlags().BoolVar(&noClient, "node-service-no-os-client", false, "If set to true then the CSI driver node service will not use the OpenStack client (default: false)")
+	cmd.PersistentFlags().MarkDeprecated("node-service-no-os-client", "This flag is deprecated and will be removed in the future. Node service do not use OpenStack credentials anymore.") //nolint:errcheck
+
+	cmd.PersistentFlags().StringVar(&attachMode, "attach-mode", "nova", "Volume attach mode: 'nova' uses Nova attach/detach, 'direct' uses Cinder Attachment API with os-brick sidecar for direct attachment (typically bare-metal nodes)")
 
 	openstack.AddExtraFlags(pflag.CommandLine)
 
-	logs.InitLogs()
-	defer logs.FlushLogs()
-
-	if err := cmd.Execute(); err != nil {
-		fmt.Fprintf(os.Stderr, "%s", err.Error())
-		os.Exit(1)
-	}
-
-	os.Exit(0)
+	code := cli.Run(cmd)
+	os.Exit(code)
 }
 
 func handle() {
+	// stopCh is closed when handle() returns, which signals informers
+	// and other background goroutines to shut down cleanly.
+	stopCh := make(chan struct{})
+	defer close(stopCh)
 
-	d := cinder.NewDriver(nodeID, endpoint, cluster)
-	// Initiliaze cloud
-	openstack.InitOpenStackProvider(cloudconfig)
-	cloud, err := openstack.GetOpenStackProvider()
-	if err != nil {
-		klog.Warningf("Failed to GetOpenStackProvider: %v", err)
-		return
+	// Initialize cloud
+	if attachMode != cinder.AttachModeNova && attachMode != cinder.AttachModeDirect {
+		klog.Fatalf("Invalid --attach-mode %q: must be %q or %q", attachMode, cinder.AttachModeNova, cinder.AttachModeDirect)
 	}
-	//Intiliaze mount
-	mount := mount.GetMountProvider()
 
-	//Intiliaze Metadatda
-	metadatda := metadata.GetMetadataProvider(cloud.GetMetadataOpts().SearchOrder)
+	d := cinder.NewDriver(&cinder.DriverOpts{
+		Endpoint:     endpoint,
+		ClusterID:    cluster,
+		PVCLister:    csi.GetPVCLister(),
+		WithTopology: withTopology,
+		AttachMode:   attachMode,
+	})
 
-	d.SetupDriver(cloud, mount, metadatda)
+	openstack.InitOpenStackProvider(cloudConfig, httpEndpoint)
+
+	if provideControllerService {
+		var err error
+		clouds := make(map[string]openstack.IOpenStack)
+		for _, cloudName := range cloudNames {
+			clouds[cloudName], err = openstack.GetOpenStackProvider(cloudName)
+			if err != nil {
+				klog.Warningf("Failed to GetOpenStackProvider %s: %v", cloudName, err)
+				return
+			}
+		}
+
+		var connProps cinder.ConnectorPropertiesGetter
+		if attachMode == cinder.AttachModeDirect {
+			kubeClient := csi.GetKubeClient()
+			var connPropsErr error
+			connProps, connPropsErr = cinder.NewKubeConnectorPropertiesGetter(kubeClient, stopCh)
+			if connPropsErr != nil {
+				klog.Fatalf("Failed to create connector properties getter: %v", connPropsErr)
+			}
+		}
+
+		d.SetupControllerService(clouds, connProps)
+	}
+
+	if provideNodeService {
+		mount := mount.GetMountProvider()
+
+		cfg, err := openstack.GetConfigFromFiles(cloudConfig)
+		if err != nil && !os.IsNotExist(err) {
+			klog.Warningf("Failed to GetConfigFromFiles: %v", err)
+			return
+		}
+
+		metadata := metadata.GetMetadataProvider(cfg.Metadata.SearchOrder)
+
+		// In direct mode, create a Kubernetes client for the node to
+		// store connector properties in its own node annotation, and
+		// create the os-brick gRPC client for volume operations.
+		var nodeKubeClient kubernetes.Interface
+		var nodeName string
+		var brickClient brick.IConnector
+		nodeClouds := make(map[string]openstack.IOpenStack)
+		if attachMode == cinder.AttachModeDirect {
+			nodeKubeClient = csi.GetKubeClient()
+			nodeName = os.Getenv("KUBE_NODE_NAME")
+			if nodeName == "" {
+				klog.Fatal("KUBE_NODE_NAME environment variable must be set in direct attach mode")
+			}
+
+			grpcConnector, err2 := brick.NewGRPCConnector(brick.Endpoint)
+			if err2 != nil {
+				klog.Fatalf("Failed to connect to os-brick sidecar at %s: %v", brick.Endpoint, err2)
+			}
+			defer grpcConnector.Close()
+			brickClient = grpcConnector
+			klog.Infof("Connected to os-brick sidecar at %s", brick.Endpoint)
+
+			// Create OpenStack clients for the node service so it
+			// can call AttachmentComplete after connecting a volume.
+			for _, cloudName := range cloudNames {
+				nodeClouds[cloudName], err2 = openstack.GetOpenStackProvider(cloudName)
+				if err2 != nil {
+					klog.Fatalf("Failed to create OpenStack provider %q for node service: %v", cloudName, err2)
+				}
+			}
+		}
+
+		d.SetupNodeService(mount, metadata, cfg.BlockStorage, additionalTopologies, brickClient, nodeKubeClient, nodeName, nodeClouds)
+	}
+
 	d.Run()
 }

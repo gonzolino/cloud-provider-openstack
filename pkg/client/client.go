@@ -17,6 +17,7 @@ limitations under the License.
 package client
 
 import (
+	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
@@ -24,12 +25,10 @@ import (
 	"runtime"
 	"strings"
 
-	"github.com/gophercloud/gophercloud"
-	"github.com/gophercloud/gophercloud/openstack"
-	"github.com/gophercloud/gophercloud/openstack/identity/v3/extensions/trusts"
-	"github.com/gophercloud/gophercloud/openstack/identity/v3/tokens"
-	"github.com/gophercloud/utils/client"
-	"github.com/gophercloud/utils/openstack/clientconfig"
+	"github.com/gophercloud/gophercloud/v2"
+	"github.com/gophercloud/gophercloud/v2/openstack"
+	"github.com/gophercloud/utils/v2/client"
+	"github.com/gophercloud/utils/v2/openstack/clientconfig"
 
 	"k8s.io/apimachinery/pkg/util/net"
 	"k8s.io/client-go/util/cert"
@@ -38,25 +37,26 @@ import (
 )
 
 type AuthOpts struct {
-	AuthURL          string                   `gcfg:"auth-url" mapstructure:"auth-url" name:"os-authURL" dependsOn:"os-password|os-trustID|os-applicationCredentialSecret|os-clientCertPath"`
-	UserID           string                   `gcfg:"user-id" mapstructure:"user-id" name:"os-userID" value:"optional" dependsOn:"os-password"`
-	Username         string                   `name:"os-userName" value:"optional" dependsOn:"os-password"`
-	Password         string                   `name:"os-password" value:"optional" dependsOn:"os-domainID|os-domainName,os-projectID|os-projectName,os-userID|os-userName"`
-	TenantID         string                   `gcfg:"tenant-id" mapstructure:"project-id" name:"os-projectID" value:"optional" dependsOn:"os-password|os-clientCertPath"`
-	TenantName       string                   `gcfg:"tenant-name" mapstructure:"project-name" name:"os-projectName" value:"optional" dependsOn:"os-password|os-clientCertPath"`
+	AuthURL          string                   `gcfg:"auth-url" mapstructure:"auth-url" name:"os-authURL" value:"optional" dependsOn:"os-password|os-trustID|os-applicationCredentialSecret|os-clientCertPath"`
+	UserID           string                   `gcfg:"user-id" mapstructure:"user-id" name:"os-userID" value:"optional"`
+	Username         string                   `name:"os-userName" value:"optional"`
+	Password         string                   `name:"os-password" value:"optional"`
+	TenantID         string                   `gcfg:"tenant-id" mapstructure:"project-id" name:"os-projectID" value:"optional"`
+	TenantName       string                   `gcfg:"tenant-name" mapstructure:"project-name" name:"os-projectName" value:"optional"`
 	TrustID          string                   `gcfg:"trust-id" mapstructure:"trust-id" name:"os-trustID" value:"optional"`
 	TrusteeID        string                   `gcfg:"trustee-id" mapstructure:"trustee-id" name:"os-trusteeID" value:"optional" dependsOn:"os-trustID"`
 	TrusteePassword  string                   `gcfg:"trustee-password" mapstructure:"trustee-password" name:"os-trusteePassword" value:"optional" dependsOn:"os-trustID"`
-	DomainID         string                   `gcfg:"domain-id" mapstructure:"domain-id" name:"os-domainID" value:"optional" dependsOn:"os-password|os-clientCertPath"`
-	DomainName       string                   `gcfg:"domain-name" mapstructure:"domain-name" name:"os-domainName" value:"optional" dependsOn:"os-password|os-clientCertPath"`
+	DomainID         string                   `gcfg:"domain-id" mapstructure:"domain-id" name:"os-domainID" value:"optional"`
+	DomainName       string                   `gcfg:"domain-name" mapstructure:"domain-name" name:"os-domainName" value:"optional"`
 	TenantDomainID   string                   `gcfg:"tenant-domain-id" mapstructure:"project-domain-id" name:"os-projectDomainID" value:"optional"`
 	TenantDomainName string                   `gcfg:"tenant-domain-name" mapstructure:"project-domain-name" name:"os-projectDomainName" value:"optional"`
 	UserDomainID     string                   `gcfg:"user-domain-id" mapstructure:"user-domain-id" name:"os-userDomainID" value:"optional"`
 	UserDomainName   string                   `gcfg:"user-domain-name" mapstructure:"user-domain-name" name:"os-userDomainName" value:"optional"`
-	Region           string                   `name:"os-region"`
+	Region           string                   `name:"os-region" value:"optional"`
 	EndpointType     gophercloud.Availability `gcfg:"os-endpoint-type" mapstructure:"os-endpoint-type" name:"os-endpointType" value:"optional"`
 	CAFile           string                   `gcfg:"ca-file" mapstructure:"ca-file" name:"os-certAuthorityPath" value:"optional"`
 	TLSInsecure      string                   `gcfg:"tls-insecure" mapstructure:"tls-insecure" name:"os-TLSInsecure" value:"optional" matches:"^true|false$"`
+	Token            string                   `gcfg:"token" mapstructure:"token" name:"os-token" value:"optional"`
 
 	// TLS client auth
 	CertFile string `gcfg:"cert-file" mapstructure:"cert-file" name:"os-clientCertPath" value:"optional" dependsOn:"os-clientKeyPath"`
@@ -69,9 +69,9 @@ type AuthOpts struct {
 	CloudsFile string `gcfg:"clouds-file,omitempty" mapstructure:"clouds-file,omitempty" name:"os-cloudsFile" value:"optional"`
 	Cloud      string `gcfg:"cloud,omitempty" mapstructure:"cloud,omitempty" name:"os-cloud" value:"optional"`
 
-	ApplicationCredentialID     string `gcfg:"application-credential-id" mapstructure:"application-credential-id" name:"os-applicationCredentialID" value:"optional"`
-	ApplicationCredentialName   string `gcfg:"application-credential-name" mapstructure:"application-credential-name" name:"os-applicationCredentialName" value:"optional"`
-	ApplicationCredentialSecret string `gcfg:"application-credential-secret" mapstructure:"application-credential-secret" name:"os-applicationCredentialSecret" value:"optional"`
+	ApplicationCredentialID     string `gcfg:"application-credential-id" mapstructure:"application-credential-id" name:"os-applicationCredentialID" value:"optional" dependsOn:"os-applicationCredentialSecret"`
+	ApplicationCredentialName   string `gcfg:"application-credential-name" mapstructure:"application-credential-name" name:"os-applicationCredentialName" value:"optional" dependsOn:"os-applicationCredentialSecret"`
+	ApplicationCredentialSecret string `gcfg:"application-credential-secret" mapstructure:"application-credential-secret" name:"os-applicationCredentialSecret" value:"optional" dependsOn:"os-applicationCredentialID|os-applicationCredentialName"`
 }
 
 func LogCfg(authOpts AuthOpts) {
@@ -106,21 +106,19 @@ func (l Logger) Printf(format string, args ...interface{}) {
 
 	// extra check in case, when verbosity has been changed dynamically
 	if debugger {
+		// Walk the stack and find the deepest gophercloud frame (matches both
+		// gophercloud/gophercloud and gophercloud/utils, where the
+		// RoundTripper lives). The frame above it is the actual caller that
+		// triggered the API request, which is what we want klog to report.
+		const gc = "/github.com/gophercloud/"
 		var skip int
-		var found bool
-		var gc = "/github.com/gophercloud/gophercloud"
-
-		// detect the depth of the actual function, which calls gophercloud code
-		// 10 is the common depth from the logger to "github.com/gophercloud/gophercloud"
-		for i := 10; i <= 20; i++ {
-			if _, file, _, ok := runtime.Caller(i); ok && !found && strings.Contains(file, gc) {
-				found = true
-				continue
-			} else if ok && found && !strings.Contains(file, gc) {
-				skip = i
+		for i := 1; ; i++ {
+			_, file, _, ok := runtime.Caller(i)
+			if !ok {
 				break
-			} else if !ok {
-				break
+			}
+			if strings.Contains(file, gc) {
+				skip = i + 1
 			}
 		}
 
@@ -151,12 +149,13 @@ func (authOpts AuthOpts) ToAuthOptions() gophercloud.AuthOptions {
 			ApplicationCredentialID:     authOpts.ApplicationCredentialID,
 			ApplicationCredentialName:   authOpts.ApplicationCredentialName,
 			ApplicationCredentialSecret: authOpts.ApplicationCredentialSecret,
+			Token:                       authOpts.Token,
 		},
 	}
 
 	ao, err := clientconfig.AuthOptions(&opts)
 	if err != nil {
-		klog.V(1).Infof("Error parsing auth: %s", err)
+		klog.V(1).Infof("Error parsing auth: %v", err)
 		return gophercloud.AuthOptions{}
 	}
 
@@ -166,10 +165,10 @@ func (authOpts AuthOpts) ToAuthOptions() gophercloud.AuthOptions {
 	return *ao
 }
 
-func (authOpts AuthOpts) ToAuth3Options() tokens.AuthOptions {
+func (authOpts AuthOpts) ToAuth3Options() gophercloud.AuthOptions {
 	ao := authOpts.ToAuthOptions()
 
-	var scope tokens.Scope
+	var scope gophercloud.AuthScope
 	if ao.Scope != nil {
 		scope.ProjectID = ao.Scope.ProjectID
 		scope.ProjectName = ao.Scope.ProjectName
@@ -177,7 +176,7 @@ func (authOpts AuthOpts) ToAuth3Options() tokens.AuthOptions {
 		scope.DomainName = ao.Scope.DomainName
 	}
 
-	return tokens.AuthOptions{
+	return gophercloud.AuthOptions{
 		IdentityEndpoint:            ao.IdentityEndpoint,
 		UserID:                      ao.UserID,
 		Username:                    ao.Username,
@@ -187,7 +186,7 @@ func (authOpts AuthOpts) ToAuth3Options() tokens.AuthOptions {
 		ApplicationCredentialID:     ao.ApplicationCredentialID,
 		ApplicationCredentialName:   ao.ApplicationCredentialName,
 		ApplicationCredentialSecret: ao.ApplicationCredentialSecret,
-		Scope:                       scope,
+		Scope:                       &scope,
 		AllowReauth:                 ao.AllowReauth,
 	}
 }
@@ -208,7 +207,7 @@ func ReadClouds(authOpts *AuthOpts) error {
 		co.Cloud = authOpts.Cloud
 	}
 	cloud, err := clientconfig.GetCloudFromYAML(co)
-	if err != nil && err.Error() != "unable to load clouds.yaml: no clouds.yaml file found" {
+	if err != nil {
 		return err
 	}
 
@@ -232,6 +231,7 @@ func ReadClouds(authOpts *AuthOpts) error {
 	authOpts.ApplicationCredentialID = replaceEmpty(authOpts.ApplicationCredentialID, cloud.AuthInfo.ApplicationCredentialID)
 	authOpts.ApplicationCredentialName = replaceEmpty(authOpts.ApplicationCredentialName, cloud.AuthInfo.ApplicationCredentialName)
 	authOpts.ApplicationCredentialSecret = replaceEmpty(authOpts.ApplicationCredentialSecret, cloud.AuthInfo.ApplicationCredentialSecret)
+	authOpts.Token = replaceEmpty(authOpts.Token, cloud.AuthInfo.Token)
 
 	return nil
 }
@@ -256,7 +256,7 @@ func NewOpenStackClient(cfg *AuthOpts, userAgent string, extraUserAgent ...strin
 		// read and parse CA certificate from file
 		caPool, err = cert.NewPool(cfg.CAFile)
 		if err != nil {
-			return nil, fmt.Errorf("failed to read and parse %s certificate: %s", cfg.CAFile, err)
+			return nil, fmt.Errorf("failed to read and parse %s certificate: %v", cfg.CAFile, err)
 		}
 	} else if cfg.CAFileContents != "" {
 		// parse CA certificate from the contents
@@ -277,7 +277,7 @@ func NewOpenStackClient(cfg *AuthOpts, userAgent string, extraUserAgent ...strin
 	if cfg.CertFile != "" && cfg.KeyFile != "" {
 		cert, err := tls.LoadX509KeyPair(cfg.CertFile, cfg.KeyFile)
 		if err != nil {
-			return nil, fmt.Errorf("error loading TLS key pair: %s", err)
+			return nil, fmt.Errorf("error loading TLS key pair: %v", err)
 		}
 		config.Certificates = []tls.Certificate{cert}
 	}
@@ -298,18 +298,15 @@ func NewOpenStackClient(cfg *AuthOpts, userAgent string, extraUserAgent ...strin
 		// if TrusteeID and TrusteePassword were defined, then use them
 		opts.UserID = replaceEmpty(cfg.TrusteeID, opts.UserID)
 		opts.Password = replaceEmpty(cfg.TrusteePassword, opts.Password)
+		opts.Scope.TrustID = replaceEmpty(cfg.TrustID, opts.Scope.TrustID)
 
-		authOptsExt := trusts.AuthOptsExt{
-			TrustID:            cfg.TrustID,
-			AuthOptionsBuilder: &opts,
-		}
-		err = openstack.AuthenticateV3(provider, authOptsExt, gophercloud.EndpointOpts{})
+		err = openstack.AuthenticateV3(context.TODO(), provider, &opts, gophercloud.EndpointOpts{})
 
 		return provider, err
 	}
 
 	opts := cfg.ToAuthOptions()
-	err = openstack.Authenticate(provider, opts)
+	err = openstack.Authenticate(context.TODO(), provider, opts)
 
 	return provider, err
 }

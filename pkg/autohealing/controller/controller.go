@@ -34,10 +34,11 @@ import (
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/client-go/tools/leaderelection/resourcelock"
 	"k8s.io/client-go/tools/record"
+	"k8s.io/client-go/util/retry"
 	log "k8s.io/klog/v2"
 
 	"k8s.io/cloud-provider-openstack/pkg/autohealing/cloudprovider"
-	_ "k8s.io/cloud-provider-openstack/pkg/autohealing/cloudprovider/register"
+	"k8s.io/cloud-provider-openstack/pkg/autohealing/cloudprovider/openstack"
 	"k8s.io/cloud-provider-openstack/pkg/autohealing/config"
 	"k8s.io/cloud-provider-openstack/pkg/autohealing/healthcheck"
 )
@@ -62,7 +63,14 @@ const (
 
 	// LabelNodeRoleMaster specifies that a node is a master
 	// Related discussion: https://github.com/kubernetes/kubernetes/pull/39112
+	// TODO: remove >= k8s 1.25
 	LabelNodeRoleMaster = "node-role.kubernetes.io/master"
+
+	// LabelNodeRoleControlPlane specifies that a node is control-plane
+	LabelNodeRoleControlPlane = "node-role.kubernetes.io/control-plane"
+
+	leaderElectionResourceLockNamespace = "kube-system"
+	leaderElectionResourceLockName      = "magnum-auto-healer"
 )
 
 var (
@@ -109,6 +117,13 @@ func createKubeClients(apiserverHost string, kubeConfig string) (*kubernetes.Cli
 
 // NewController creates a new autohealer controller.
 func NewController(conf config.Config) *Controller {
+	// register healthchecks
+	healthcheck.RegisterHealthCheck(healthcheck.EndpointType, healthcheck.NewEndpointCheck)
+	healthcheck.RegisterHealthCheck(healthcheck.NodeConditionType, healthcheck.NewNodeConditionCheck)
+
+	// register clouds
+	cloudprovider.RegisterCloudProvider(openstack.ProviderName, openstack.NewOpenStackCloudProvider)
+
 	// initialize k8s clients
 	kubeClient, leaderElectionClient, err := createKubeClients(conf.Kubernetes.ApiserverHost, conf.Kubernetes.KubeConfig)
 	if err != nil {
@@ -183,8 +198,8 @@ type Controller struct {
 
 // UpdateNodeAnnotation updates the specified node annotation, if value equals empty string, the annotation will be
 // removed. This implements the interface healthcheck.NodeController
-func (c *Controller) UpdateNodeAnnotation(node healthcheck.NodeInfo, annotation string, value string) error {
-	n, err := c.kubeClient.CoreV1().Nodes().Get(context.TODO(), node.KubeNode.Name, metav1.GetOptions{})
+func (c *Controller) UpdateNodeAnnotation(ctx context.Context, node healthcheck.NodeInfo, annotation string, value string) error {
+	n, err := c.kubeClient.CoreV1().Nodes().Get(ctx, node.KubeNode.Name, metav1.GetOptions{})
 	if err != nil {
 		return err
 	}
@@ -195,7 +210,7 @@ func (c *Controller) UpdateNodeAnnotation(node healthcheck.NodeInfo, annotation 
 		n.Annotations[annotation] = value
 	}
 
-	if _, err := c.kubeClient.CoreV1().Nodes().Update(context.TODO(), n, metav1.UpdateOptions{}); err != nil {
+	if _, err := c.kubeClient.CoreV1().Nodes().Update(ctx, n, metav1.UpdateOptions{}); err != nil {
 		return err
 	}
 
@@ -212,9 +227,9 @@ func (c *Controller) GetLeaderElectionLock() (resourcelock.Interface, error) {
 	id = id + "_" + string(uuid.NewUUID())
 
 	rl, err := resourcelock.New(
-		"configmaps",
-		"kube-system",
-		"magnum-auto-healer",
+		resourcelock.LeasesResourceLock,
+		leaderElectionResourceLockNamespace,
+		leaderElectionResourceLockName,
 		c.leaderElectionClient.CoreV1(),
 		c.leaderElectionClient.CoordinationV1(),
 		resourcelock.ResourceLockConfig{
@@ -229,7 +244,7 @@ func (c *Controller) GetLeaderElectionLock() (resourcelock.Interface, error) {
 }
 
 // getUnhealthyMasterNodes returns the master nodes that need to be repaired.
-func (c *Controller) getUnhealthyMasterNodes() ([]healthcheck.NodeInfo, error) {
+func (c *Controller) getUnhealthyMasterNodes(ctx context.Context) ([]healthcheck.NodeInfo, error) {
 	var nodes []healthcheck.NodeInfo
 
 	// If no checkers defined, skip
@@ -239,12 +254,14 @@ func (c *Controller) getUnhealthyMasterNodes() ([]healthcheck.NodeInfo, error) {
 	}
 
 	// Get all the master nodes need to check
-	nodeList, err := c.kubeClient.CoreV1().Nodes().List(context.TODO(), metav1.ListOptions{})
+	nodeList, err := c.kubeClient.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
 	if err != nil {
 		return nil, err
 	}
 	for _, node := range nodeList.Items {
-		if _, hasMasterRoleLabel := node.Labels[LabelNodeRoleMaster]; hasMasterRoleLabel {
+		_, masterLabel := node.Labels[LabelNodeRoleMaster]
+		_, controlPlaneLabel := node.Labels[LabelNodeRoleControlPlane]
+		if masterLabel || controlPlaneLabel {
 			if time.Now().Before(node.ObjectMeta.GetCreationTimestamp().Add(c.config.CheckDelayAfterAdd)) {
 				log.V(4).Infof("The node %s is created less than the configured check delay, skip", node.Name)
 				continue
@@ -255,13 +272,13 @@ func (c *Controller) getUnhealthyMasterNodes() ([]healthcheck.NodeInfo, error) {
 	}
 
 	// Do health check
-	unhealthyNodes := healthcheck.CheckNodes(c.masterCheckers, nodes, c)
+	unhealthyNodes := healthcheck.CheckNodes(ctx, c.masterCheckers, nodes, c)
 
 	return unhealthyNodes, nil
 }
 
 // getUnhealthyWorkerNodes returns the nodes that need to be repaired.
-func (c *Controller) getUnhealthyWorkerNodes() ([]healthcheck.NodeInfo, error) {
+func (c *Controller) getUnhealthyWorkerNodes(ctx context.Context) ([]healthcheck.NodeInfo, error) {
 	var nodes []healthcheck.NodeInfo
 
 	// If no checkers defined, skip.
@@ -271,12 +288,14 @@ func (c *Controller) getUnhealthyWorkerNodes() ([]healthcheck.NodeInfo, error) {
 	}
 
 	// Get all the worker nodes.
-	nodeList, err := c.kubeClient.CoreV1().Nodes().List(context.TODO(), metav1.ListOptions{})
+	nodeList, err := c.kubeClient.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
 	if err != nil {
 		return nil, err
 	}
 	for _, node := range nodeList.Items {
-		if _, hasMasterRoleLabel := node.Labels[LabelNodeRoleMaster]; hasMasterRoleLabel {
+		_, masterLabel := node.Labels[LabelNodeRoleMaster]
+		_, controlPlaneLabel := node.Labels[LabelNodeRoleControlPlane]
+		if masterLabel || controlPlaneLabel {
 			continue
 		}
 		if len(node.Status.Conditions) == 0 {
@@ -290,12 +309,12 @@ func (c *Controller) getUnhealthyWorkerNodes() ([]healthcheck.NodeInfo, error) {
 	}
 
 	// Do health check
-	unhealthyNodes := healthcheck.CheckNodes(c.workerCheckers, nodes, c)
+	unhealthyNodes := healthcheck.CheckNodes(ctx, c.workerCheckers, nodes, c)
 
 	return unhealthyNodes, nil
 }
 
-func (c *Controller) repairNodes(unhealthyNodes []healthcheck.NodeInfo) {
+func (c *Controller) repairNodes(ctx context.Context, unhealthyNodes []healthcheck.NodeInfo) {
 	unhealthyNodeNames := sets.NewString()
 	for _, n := range unhealthyNodes {
 		unhealthyNodeNames.Insert(n.KubeNode.Name)
@@ -303,7 +322,7 @@ func (c *Controller) repairNodes(unhealthyNodes []healthcheck.NodeInfo) {
 
 	// Trigger unhealthy nodes repair.
 	if len(unhealthyNodes) > 0 {
-		if !c.provider.Enabled() {
+		if !c.provider.Enabled(ctx) {
 			// The cloud provider doesn't allow to trigger node repair.
 			log.Infof("Auto healing is ignored for nodes %s", unhealthyNodeNames.List())
 		} else {
@@ -313,18 +332,36 @@ func (c *Controller) repairNodes(unhealthyNodes []healthcheck.NodeInfo) {
 				// Cordon the nodes before repair.
 				for _, node := range unhealthyNodes {
 					nodeName := node.KubeNode.Name
-					newNode := node.KubeNode.DeepCopy()
-					newNode.Spec.Unschedulable = true
 
-					if _, err := c.kubeClient.CoreV1().Nodes().Update(context.TODO(), newNode, metav1.UpdateOptions{}); err != nil {
-						log.Errorf("Failed to cordon node %s, error: %v", nodeName, err)
-					} else {
-						log.Infof("Node %s is cordoned", nodeName)
+					// Skip cordon for master node
+					if !node.IsWorker {
+						continue
+					}
+					retryErr := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+						// Retrieve the latest version of Node before attempting update
+						// RetryOnConflict uses exponential backoff to avoid exhausting the apiserver
+						newNode, err := c.kubeClient.CoreV1().Nodes().Get(ctx, nodeName, metav1.GetOptions{})
+						if err != nil {
+							log.Errorf("Failed to get node %s, error: %v before update", nodeName, err)
+							return err
+						}
+						newNode.Spec.Unschedulable = true
+						if _, updateErr := c.kubeClient.CoreV1().Nodes().Update(ctx, newNode, metav1.UpdateOptions{}); updateErr != nil {
+							log.Warningf("Failed in retry to cordon node %s, error: %v", nodeName, updateErr)
+							return updateErr
+						} else {
+							log.Infof("Node %s is cordoned", nodeName)
+							return nil
+						}
+					})
+					if retryErr != nil {
+						log.Errorf("Failed to cordon node %s, error: %v", nodeName, retryErr)
+
 					}
 				}
 
 				// Start to repair all the unhealthy nodes.
-				if err := c.provider.Repair(unhealthyNodes); err != nil {
+				if err := c.provider.Repair(ctx, unhealthyNodes); err != nil {
 					log.Errorf("Failed to repair the nodes %s, error: %v", unhealthyNodeNames.List(), err)
 				}
 			}
@@ -334,12 +371,12 @@ func (c *Controller) repairNodes(unhealthyNodes []healthcheck.NodeInfo) {
 
 // startMasterMonitor checks if there are failed master nodes and triggers the repair action. This function is supposed
 // to be running in a goroutine.
-func (c *Controller) startMasterMonitor(wg *sync.WaitGroup) {
+func (c *Controller) startMasterMonitor(ctx context.Context, wg *sync.WaitGroup) {
 	log.V(3).Info("Starting to check master nodes.")
 	defer wg.Done()
 
 	// Get all the unhealthy master nodes.
-	unhealthyNodes, err := c.getUnhealthyMasterNodes()
+	unhealthyNodes, err := c.getUnhealthyMasterNodes(ctx)
 	if err != nil {
 		log.Errorf("Failed to get unhealthy master nodes, error: %v", err)
 		return
@@ -347,7 +384,7 @@ func (c *Controller) startMasterMonitor(wg *sync.WaitGroup) {
 
 	masterUnhealthyNodes = append(masterUnhealthyNodes, unhealthyNodes...)
 
-	c.repairNodes(unhealthyNodes)
+	c.repairNodes(ctx, unhealthyNodes)
 
 	if len(unhealthyNodes) == 0 {
 		log.V(3).Info("Master nodes are healthy")
@@ -358,12 +395,12 @@ func (c *Controller) startMasterMonitor(wg *sync.WaitGroup) {
 
 // startWorkerMonitor checks if there are failed worker nodes and triggers the repair action. This function is supposed
 // to be running in a goroutine.
-func (c *Controller) startWorkerMonitor(wg *sync.WaitGroup) {
+func (c *Controller) startWorkerMonitor(ctx context.Context, wg *sync.WaitGroup) {
 	log.V(3).Info("Starting to check worker nodes.")
 	defer wg.Done()
 
 	// Get all the unhealthy worker nodes.
-	unhealthyNodes, err := c.getUnhealthyWorkerNodes()
+	unhealthyNodes, err := c.getUnhealthyWorkerNodes(ctx)
 	if err != nil {
 		log.Errorf("Failed to get unhealthy worker nodes, error: %v", err)
 		return
@@ -371,7 +408,7 @@ func (c *Controller) startWorkerMonitor(wg *sync.WaitGroup) {
 
 	workerUnhealthyNodes = append(workerUnhealthyNodes, unhealthyNodes...)
 
-	c.repairNodes(unhealthyNodes)
+	c.repairNodes(ctx, unhealthyNodes)
 
 	if len(unhealthyNodes) == 0 {
 		log.V(3).Info("Worker nodes are healthy")
@@ -391,19 +428,23 @@ func (c *Controller) Start(ctx context.Context) {
 	for {
 		masterUnhealthyNodes = []healthcheck.NodeInfo{}
 		workerUnhealthyNodes = []healthcheck.NodeInfo{}
-		select {
-		case <-ticker.C:
-			if c.config.MasterMonitorEnabled {
-				wg.Add(1)
-				go c.startMasterMonitor(&wg)
-			}
-			if c.config.WorkerMonitorEnabled {
-				wg.Add(1)
-				go c.startWorkerMonitor(&wg)
-			}
+		<-ticker.C
+		if c.config.MasterMonitorEnabled {
+			wg.Add(1)
+			go c.startMasterMonitor(ctx, &wg)
+		}
+		if c.config.WorkerMonitorEnabled {
+			wg.Add(1)
+			go c.startWorkerMonitor(ctx, &wg)
+		}
 
-			wg.Wait()
-			c.provider.UpdateHealthStatus(masterUnhealthyNodes, workerUnhealthyNodes)
+		wg.Wait()
+
+		if c.provider.Enabled(ctx) {
+			err := c.provider.UpdateHealthStatus(ctx, masterUnhealthyNodes, workerUnhealthyNodes)
+			if err != nil {
+				log.Warningf("Unable to update health status. Retrying. %v", err)
+			}
 		}
 	}
 }

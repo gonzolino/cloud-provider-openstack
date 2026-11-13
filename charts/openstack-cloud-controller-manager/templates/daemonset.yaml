@@ -2,8 +2,12 @@ apiVersion: apps/v1
 kind: DaemonSet
 metadata:
   name: {{ include "occm.name" . }}
-  labels:
-    {{- include "occm.labels" . | nindent 4 }}
+  labels: {{- include "occm.labels.standard" . | nindent 4 }}
+  namespace: {{ .Release.Namespace }}
+  annotations:
+    {{- with .Values.commonAnnotations }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
 spec:
   selector:
     matchLabels:
@@ -13,34 +17,52 @@ spec:
   template:
     metadata:
       annotations:
-         checksum/config: {{ include "cloudConfig" . | sha256sum }}
+        checksum/config: {{ print (include "cloudConfig" .) (.Values.cloudConfigContents | default "") | sha256sum }}
+        {{- include "occm.controllermanager.annotations" . | nindent 8 }}
       labels:
         {{- include "occm.controllermanager.labels" . | nindent 8 }}
     spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+      {{- with .Values.podSecurityContext }}
       securityContext:
-        runAsUser: 1001
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       {{- with .Values.tolerations }}
       tolerations:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      serviceAccountName: openstack-cloud-controller-manager
+      {{- with .Values.hostAliases }}
+      hostAliases:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ .Values.serviceAccountName }}
       containers:
         - name: openstack-cloud-controller-manager
           image: "{{ .Values.image.repository }}:{{ default .Chart.AppVersion .Values.image.tag }}"
+          {{- with .Values.securityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
           args:
             - /bin/openstack-cloud-controller-manager
-            - --v=1
+            - --v={{ .Values.logVerbosityLevel }}
             - --cloud-config=$(CLOUD_CONFIG)
+            - --cluster-name=$(CLUSTER_NAME)
             - --cloud-provider=openstack
-            - --use-service-account-credentials=true
+            - --use-service-account-credentials=false
+            - --controllers={{- trimAll "," (include "occm.enabledControllers" . ) -}}
             {{- if .Values.serviceMonitor.enabled }}
-            - --address=0.0.0.0
+            - --authorization-always-allow-paths=/metrics
+            - --bind-address=0.0.0.0
             {{- else }}
-            - --address=127.0.0.1
+            - --bind-address=127.0.0.1
             {{- end }}
             {{- if .Values.controllerExtraArgs }}
             {{- with .Values.controllerExtraArgs }}
@@ -54,18 +76,17 @@ spec:
             name: http
             protocol: TCP
           {{- end }}
+          {{- if or (.Values.extraVolumeMounts) (.Values.secret.enabled) }}
           volumeMounts:
-            - mountPath: /etc/kubernetes/pki
-              name: k8s-certs
-              readOnly: true
-            - mountPath: /etc/ssl/certs
-              name: ca-certs
-              readOnly: true
+          {{- end }}
+          {{- if .Values.secret.enabled }}
             - mountPath: /etc/config
               name: cloud-config-volume
               readOnly: true
-            - mountPath: /usr/libexec/kubernetes/kubelet-plugins/volume/exec
-              name: flexvolume-dir
+          {{- end }}
+          {{- if .Values.extraVolumeMounts }}
+            {{- toYaml .Values.extraVolumeMounts | nindent 12 }}
+          {{- end }}
           {{- if .Values.livenessProbe }}
           livenessProbe:
             {{- toYaml .Values.livenessProbe | nindent 12 }}
@@ -81,20 +102,28 @@ spec:
           env:
             - name: CLOUD_CONFIG
               value: /etc/config/cloud.conf
-      hostNetwork: true
+            - name: CLUSTER_NAME
+              value: {{ .Values.cluster.name }}
+            {{- if .Values.extraEnv }}
+              {{- toYaml .Values.extraEnv | nindent 12 }}
+            {{- end }}
+      {{- if .Values.extraInitContainers }}
+      initContainers: {{ toYaml .Values.extraInitContainers | nindent 6 }}
+      {{- end }}
+      hostNetwork: {{ .Values.hostNetwork }}
+      dnsPolicy: {{ .Values.dnsPolicy }}
+      {{- if .Values.priorityClassName }}
+      priorityClassName: {{ .Values.priorityClassName }}
+      {{- end }}
+
+      {{- if or (.Values.extraVolumes) (.Values.secret.enabled) }}
       volumes:
-      - hostPath:
-          path: /usr/libexec/kubernetes/kubelet-plugins/volume/exec
-          type: DirectoryOrCreate
-        name: flexvolume-dir
-      - hostPath:
-          path: /etc/kubernetes/pki
-          type: DirectoryOrCreate
-        name: k8s-certs
-      - hostPath:
-          path: /etc/ssl/certs
-          type: DirectoryOrCreate
-        name: ca-certs
+      {{- end }}
+      {{- if .Values.secret.enabled }}
       - name: cloud-config-volume
         secret:
-          secretName: {{ .Values.secret.name | default "cloud-config" }}
+          secretName: {{ .Values.secret.name }}
+      {{- end }}
+      {{- if .Values.extraVolumes }}
+        {{ toYaml .Values.extraVolumes | nindent 6 }}
+      {{- end }}

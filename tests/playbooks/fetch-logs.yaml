@@ -1,0 +1,10 @@
+- hosts: all
+  become_method: sudo
+  gather_facts: true
+
+  vars:
+    user: stack
+    devstack_workdir: /home/{{ user }}/devstack
+
+  roles:
+    - role: fetch-logs

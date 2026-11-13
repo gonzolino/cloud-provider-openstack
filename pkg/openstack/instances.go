@@ -1,5 +1,5 @@
 /*
-Copyright 2016 The Kubernetes Authors.
+Copyright 2024 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -19,48 +19,44 @@ package openstack
 import (
 	"context"
 	"fmt"
+	sysos "os"
 	"regexp"
 	"strings"
 
-	"github.com/gophercloud/gophercloud"
-	"github.com/gophercloud/gophercloud/openstack/compute/v2/flavors"
-	"github.com/gophercloud/gophercloud/openstack/compute/v2/servers"
-	"k8s.io/klog/v2"
+	"github.com/gophercloud/gophercloud/v2"
+	"github.com/gophercloud/gophercloud/v2/openstack/compute/v2/flavors"
+	"github.com/gophercloud/gophercloud/v2/openstack/compute/v2/servers"
+	"github.com/gophercloud/gophercloud/v2/openstack/networking/v2/ports"
+	"github.com/gophercloud/gophercloud/v2/pagination"
 
-	"k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/types"
+	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/util/validation"
 	cloudprovider "k8s.io/cloud-provider"
 	"k8s.io/cloud-provider-openstack/pkg/client"
 	"k8s.io/cloud-provider-openstack/pkg/metrics"
+	"k8s.io/cloud-provider-openstack/pkg/util"
 	"k8s.io/cloud-provider-openstack/pkg/util/errors"
-	"k8s.io/cloud-provider-openstack/pkg/util/metadata"
+	"k8s.io/klog/v2"
 )
-
-// Instances encapsulates an implementation of Instances for OpenStack.
-type Instances struct {
-	compute        *gophercloud.ServiceClient
-	opts           metadata.MetadataOpts
-	networkingOpts NetworkingOpts
-}
 
 const (
-	instanceShutoff = "SHUTOFF"
+	RegionalProviderIDEnv = "OS_CCM_REGIONAL"
+	instanceShutoff       = "SHUTOFF"
+	labelHostID           = "topology.openstack.org/host-id"
 )
 
-// Instances returns an implementation of Instances for OpenStack.
-func (os *OpenStack) Instances() (cloudprovider.Instances, bool) {
-	return os.instances()
+// InstancesV2 encapsulates an implementation of InstancesV2 for OpenStack.
+type InstancesV2 struct {
+	compute          *gophercloud.ServiceClient
+	network          *gophercloud.ServiceClient
+	region           string
+	regionProviderID bool
+	networkingOpts   NetworkingOpts
 }
 
 // InstancesV2 returns an implementation of InstancesV2 for OpenStack.
-// TODO: Support InstancesV2 in the future.
 func (os *OpenStack) InstancesV2() (cloudprovider.InstancesV2, bool) {
-	return nil, false
-}
-
-func (os *OpenStack) instances() (*Instances, bool) {
-	klog.V(4).Info("openstack.Instances() called")
+	klog.V(4).Info("openstack.Instancesv2() called")
 
 	compute, err := client.NewComputeV2(os.provider, os.epOpts)
 	if err != nil {
@@ -68,116 +64,45 @@ func (os *OpenStack) instances() (*Instances, bool) {
 		return nil, false
 	}
 
-	return &Instances{
-		compute:        compute,
-		opts:           os.metadataOpts,
-		networkingOpts: os.networkingOpts,
+	network, err := client.NewNetworkV2(os.provider, os.epOpts)
+	if err != nil {
+		klog.Errorf("unable to access network v2 API : %v", err)
+		return nil, false
+	}
+
+	regionalProviderID := false
+	if isRegionalProviderID := sysos.Getenv(RegionalProviderIDEnv); isRegionalProviderID == "true" {
+		regionalProviderID = true
+	}
+
+	return &InstancesV2{
+		compute:          compute,
+		network:          network,
+		region:           os.epOpts.Region,
+		regionProviderID: regionalProviderID,
+		networkingOpts:   os.networkingOpts,
 	}, true
 }
 
-// CurrentNodeName implements Instances.CurrentNodeName
-// Note this is *not* necessarily the same as hostname.
-func (i *Instances) CurrentNodeName(ctx context.Context, hostname string) (types.NodeName, error) {
-	md, err := metadata.Get(i.opts.SearchOrder)
-	if err != nil {
-		return "", err
+// InstanceExists indicates whether a given node exists according to the cloud provider
+func (i *InstancesV2) InstanceExists(ctx context.Context, node *v1.Node) (bool, error) {
+	_, err := i.getInstance(ctx, node)
+	if err == cloudprovider.InstanceNotFound {
+		klog.V(6).Infof("instance not found for node: %s", node.Name)
+		return false, nil
 	}
-	return types.NodeName(md.Name), nil
-}
-
-// AddSSHKeyToAllInstances is not implemented for OpenStack
-func (i *Instances) AddSSHKeyToAllInstances(ctx context.Context, user string, keyData []byte) error {
-	return cloudprovider.NotImplemented
-}
-
-// NodeAddresses implements Instances.NodeAddresses
-func (i *Instances) NodeAddresses(ctx context.Context, name types.NodeName) ([]v1.NodeAddress, error) {
-	klog.V(4).Infof("NodeAddresses(%v) called", name)
-
-	addrs, err := getAddressesByName(i.compute, name, i.networkingOpts)
-	if err != nil {
-		return nil, err
-	}
-
-	klog.V(4).Infof("NodeAddresses(%v) => %v", name, addrs)
-	return addrs, nil
-}
-
-// NodeAddressesByProviderID returns the node addresses of an instances with the specified unique providerID
-// This method will not be called from the node that is requesting this ID. i.e. metadata service
-// and other local methods cannot be used here
-func (i *Instances) NodeAddressesByProviderID(ctx context.Context, providerID string) ([]v1.NodeAddress, error) {
-	klog.V(4).Infof("NodeAddressesByProviderID (%v) called", providerID)
-
-	instanceID, err := instanceIDFromProviderID(providerID)
 
 	if err != nil {
-		return []v1.NodeAddress{}, err
-	}
-
-	mc := metrics.NewMetricContext("server", "get")
-	server, err := servers.Get(i.compute, instanceID).Extract()
-
-	if mc.ObserveRequest(err) != nil {
-		return []v1.NodeAddress{}, err
-	}
-
-	interfaces, err := getAttachedInterfacesByID(i.compute, server.ID)
-	if err != nil {
-		return []v1.NodeAddress{}, err
-	}
-
-	addresses, err := nodeAddresses(server, interfaces, i.networkingOpts)
-	if err != nil {
-		return []v1.NodeAddress{}, err
-	}
-
-	klog.V(4).Infof("NodeAddressesByProviderID(%v) => %v", providerID, addresses)
-	return addresses, nil
-}
-
-// InstanceExists returns true if the instance for the given node exists.
-func (i *Instances) InstanceExists(ctx context.Context, node *v1.Node) (bool, error) {
-	return i.InstanceExistsByProviderID(ctx, node.Spec.ProviderID)
-}
-
-// InstanceExistsByProviderID returns true if the instance with the given provider id still exists.
-// If false is returned with no error, the instance will be immediately deleted by the cloud controller manager.
-func (i *Instances) InstanceExistsByProviderID(ctx context.Context, providerID string) (bool, error) {
-	instanceID, err := instanceIDFromProviderID(providerID)
-	if err != nil {
-		return false, err
-	}
-
-	mc := metrics.NewMetricContext("server", "get")
-	_, err = servers.Get(i.compute, instanceID).Extract()
-	if mc.ObserveRequest(err) != nil {
-		if errors.IsNotFound(err) {
-			return false, nil
-		}
 		return false, err
 	}
 
 	return true, nil
 }
 
-// InstanceShutdown returns true if the instances is in safe state to detach volumes.
-// It is the only state, where volumes can be detached immediately.
-func (i *Instances) InstanceShutdown(ctx context.Context, node *v1.Node) (bool, error) {
-	return i.InstanceShutdownByProviderID(ctx, node.Spec.ProviderID)
-}
-
-// InstanceShutdownByProviderID returns true if the instances is in safe state to detach volumes.
-// It is the only state, where volumes can be detached immediately.
-func (i *Instances) InstanceShutdownByProviderID(ctx context.Context, providerID string) (bool, error) {
-	instanceID, err := instanceIDFromProviderID(providerID)
+// InstanceShutdown returns true if the instance is shutdown according to the cloud provider.
+func (i *InstancesV2) InstanceShutdown(ctx context.Context, node *v1.Node) (bool, error) {
+	server, err := i.getInstance(ctx, node)
 	if err != nil {
-		return false, err
-	}
-
-	mc := metrics.NewMetricContext("server", "get")
-	server, err := servers.Get(i.compute, instanceID).Extract()
-	if mc.ObserveRequest(err) != nil {
 		return false, err
 	}
 
@@ -185,100 +110,164 @@ func (i *Instances) InstanceShutdownByProviderID(ctx context.Context, providerID
 	if server.Status == instanceShutoff {
 		return true, nil
 	}
+
 	return false, nil
 }
 
-// InstanceMetadata returns metadata of the specified instance.
-func (i *Instances) InstanceMetadata(ctx context.Context, node *v1.Node) (*cloudprovider.InstanceMetadata, error) {
-	instanceID, err := instanceIDFromProviderID(node.Spec.ProviderID)
+// InstanceMetadata returns the instance's metadata.
+func (i *InstancesV2) InstanceMetadata(ctx context.Context, node *v1.Node) (*cloudprovider.InstanceMetadata, error) {
+	srv, err := i.getInstance(ctx, node)
+	if err != nil {
+		return nil, err
+	}
+	var server servers.Server
+	if srv != nil {
+		server = *srv
+	}
+
+	instanceType, err := srvInstanceType(ctx, i.compute, &server)
 	if err != nil {
 		return nil, err
 	}
 
-	srv, err := servers.Get(i.compute, instanceID).Extract()
+	ports, err := getAttachedPorts(ctx, i.network, server.ID)
 	if err != nil {
 		return nil, err
 	}
 
-	instanceType, err := srvInstanceType(i.compute, srv)
+	addresses, err := nodeAddresses(ctx, &server, ports, i.network, i.networkingOpts)
 	if err != nil {
 		return nil, err
 	}
 
-	interfaces, err := getAttachedInterfacesByID(i.compute, srv.ID)
-	if err != nil {
-		return nil, err
-	}
-	addresses, err := nodeAddresses(srv, interfaces, i.networkingOpts)
-	if err != nil {
-		return nil, err
-	}
+	availabilityZone := util.SanitizeLabel(server.AvailabilityZone)
 
 	return &cloudprovider.InstanceMetadata{
-		ProviderID:    node.Spec.ProviderID,
-		InstanceType:  instanceType,
-		NodeAddresses: addresses,
+		ProviderID:       i.makeInstanceID(&server),
+		InstanceType:     instanceType,
+		NodeAddresses:    addresses,
+		Zone:             availabilityZone,
+		Region:           i.region,
+		AdditionalLabels: getAdditionalLabels(&server),
 	}, nil
 }
 
-// InstanceID returns the kubelet's cloud provider ID.
-func (os *OpenStack) InstanceID() (string, error) {
-	if len(os.localInstanceID) == 0 {
-		id, err := readInstanceID(os.metadataOpts.SearchOrder)
+func (i *InstancesV2) makeInstanceID(srv *servers.Server) string {
+	if i.regionProviderID {
+		return fmt.Sprintf("%s://%s/%s", ProviderName, i.region, srv.ID)
+	}
+	return fmt.Sprintf("%s:///%s", ProviderName, srv.ID)
+}
+
+func instanceLookupError(err error) error {
+	if err == nil {
+		return nil
+	}
+	if errors.IsNotFound(err) {
+		return cloudprovider.InstanceNotFound
+	}
+	return err
+}
+
+func (i *InstancesV2) getInstance(ctx context.Context, node *v1.Node) (*servers.Server, error) {
+	if node.Spec.ProviderID == "" {
+		server, err := getServerByName(ctx, i.compute, node.Name)
 		if err != nil {
-			return "", err
+			return nil, instanceLookupError(err)
 		}
-		os.localInstanceID = id
+		return server, nil
 	}
-	return os.localInstanceID, nil
-}
 
-// InstanceID returns the cloud provider ID of the specified instance.
-func (i *Instances) InstanceID(ctx context.Context, name types.NodeName) (string, error) {
-	srv, err := getServerByName(i.compute, name)
+	instanceID, instanceRegion, err := instanceIDFromProviderID(node.Spec.ProviderID)
 	if err != nil {
-		if err == ErrNotFound {
-			return "", cloudprovider.InstanceNotFound
-		}
-		return "", err
+		return nil, err
 	}
-	// In the future it is possible to also return an endpoint as:
-	// <endpoint>/<instanceid>
-	return "/" + srv.ID, nil
-}
 
-// InstanceTypeByProviderID returns the cloudprovider instance type of the node with the specified unique providerID
-// This method will not be called from the node that is requesting this ID. i.e. metadata service
-// and other local methods cannot be used here
-func (i *Instances) InstanceTypeByProviderID(ctx context.Context, providerID string) (string, error) {
-	instanceID, err := instanceIDFromProviderID(providerID)
-
-	if err != nil {
-		return "", err
+	if instanceRegion != "" && instanceRegion != i.region {
+		return nil, fmt.Errorf("ProviderID \"%s\" didn't match supported region \"%s\"", node.Spec.ProviderID, i.region)
 	}
 
 	mc := metrics.NewMetricContext("server", "get")
-	server, err := servers.Get(i.compute, instanceID).Extract()
-
+	server, err := servers.Get(ctx, i.compute, instanceID).Extract()
 	if mc.ObserveRequest(err) != nil {
-		return "", err
+		return nil, instanceLookupError(err)
 	}
-
-	return srvInstanceType(i.compute, server)
+	return server, nil
 }
 
-// InstanceType returns the type of the specified instance.
-func (i *Instances) InstanceType(ctx context.Context, name types.NodeName) (string, error) {
-	srv, err := getServerByName(i.compute, name)
+func getServerByName(ctx context.Context, client *gophercloud.ServiceClient, name string) (*servers.Server, error) {
+	opts := servers.ListOpts{
+		Name: fmt.Sprintf("^%s$", regexp.QuoteMeta(name)),
+	}
 
+	serverList := make([]servers.Server, 0, 1)
+
+	mc := metrics.NewMetricContext("server", "list")
+	pager := servers.List(client, opts)
+
+	err := pager.EachPage(ctx, func(_ context.Context, page pagination.Page) (bool, error) {
+		s, err := servers.ExtractServers(page)
+		if err != nil {
+			return false, err
+		}
+		serverList = append(serverList, s...)
+		if len(serverList) > 1 {
+			return false, errors.ErrMultipleResults
+		}
+		return true, nil
+	})
+	if mc.ObserveRequest(err) != nil {
+		return nil, err
+	}
+
+	if len(serverList) == 0 {
+		return nil, cloudprovider.InstanceNotFound
+	}
+
+	return &serverList[0], nil
+}
+
+// If Instances.InstanceID or cloudprovider.GetInstanceProviderID is changed, the regexp should be changed too.
+var providerIDRegexp = regexp.MustCompile(`^` + ProviderName + `://([^/]*)/([^/]+)$`)
+
+// instanceIDFromProviderID splits a provider's id and return instanceID.
+// A providerID is build out of '${ProviderName}:///${instance-id}' which contains ':///'.
+// or '${ProviderName}://${region}/${instance-id}' which contains '://'.
+// See cloudprovider.GetInstanceProviderID and Instances.InstanceID.
+func instanceIDFromProviderID(providerID string) (instanceID string, region string, err error) {
+	// https://github.com/kubernetes/kubernetes/issues/85731
+	if providerID != "" && !strings.Contains(providerID, "://") {
+		providerID = ProviderName + "://" + providerID
+	}
+
+	matches := providerIDRegexp.FindStringSubmatch(providerID)
+	if len(matches) != 3 {
+		return "", "", fmt.Errorf("ProviderID \"%s\" didn't match expected format \"openstack://region/InstanceID\"", providerID)
+	}
+	return matches[2], matches[1], nil
+}
+
+// getAttachedPorts returns a list of ports attached to a server.
+func getAttachedPorts(ctx context.Context, client *gophercloud.ServiceClient, serverID string) ([]PortWithTrunkDetails, error) {
+	var allPorts []PortWithTrunkDetails
+
+	listOpts := ports.ListOpts{
+		DeviceID: serverID,
+	}
+	allPages, err := ports.List(client, listOpts).AllPages(ctx)
 	if err != nil {
-		return "", err
+		return allPorts, err
 	}
 
-	return srvInstanceType(i.compute, &srv.Server)
+	err = ports.ExtractPortsInto(allPages, &allPorts)
+	if err != nil {
+		return allPorts, err
+	}
+
+	return allPorts, nil
 }
 
-func srvInstanceType(client *gophercloud.ServiceClient, srv *servers.Server) (string, error) {
+func srvInstanceType(ctx context.Context, client *gophercloud.ServiceClient, srv *servers.Server) (string, error) {
 	keys := []string{"original_name", "id"}
 	for _, key := range keys {
 		val, found := srv.Flavor[key]
@@ -297,7 +286,7 @@ func srvInstanceType(client *gophercloud.ServiceClient, srv *servers.Server) (st
 
 		// get flavor name by id
 		mc := metrics.NewMetricContext("flavor", "get")
-		f, err := flavors.Get(client, flavor).Extract()
+		f, err := flavors.Get(ctx, client, flavor).Extract()
 		if mc.ObserveRequest(err) == nil {
 			if isValidLabelValue(f.Name) {
 				return f.Name, nil
@@ -309,65 +298,20 @@ func srvInstanceType(client *gophercloud.ServiceClient, srv *servers.Server) (st
 	return "", fmt.Errorf("flavor original_name/id not found")
 }
 
+func getAdditionalLabels(srv *servers.Server) map[string]string {
+	hostID := util.SanitizeLabel(srv.HostID)
+	if hostID == "" {
+		return nil
+	}
+
+	return map[string]string{
+		labelHostID: hostID,
+	}
+}
+
 func isValidLabelValue(v string) bool {
 	if errs := validation.IsValidLabelValue(v); len(errs) != 0 {
 		return false
 	}
 	return true
-}
-
-// If Instances.InstanceID or cloudprovider.GetInstanceProviderID is changed, the regexp should be changed too.
-var providerIDRegexp = regexp.MustCompile(`^` + ProviderName + `:///([^/]+)$`)
-
-// instanceIDFromProviderID splits a provider's id and return instanceID.
-// A providerID is build out of '${ProviderName}:///${instance-id}'which contains ':///'.
-// See cloudprovider.GetInstanceProviderID and Instances.InstanceID.
-func instanceIDFromProviderID(providerID string) (instanceID string, err error) {
-
-	// https://github.com/kubernetes/kubernetes/issues/85731
-	if providerID != "" && !strings.Contains(providerID, "://") {
-		providerID = ProviderName + "://" + providerID
-	}
-
-	matches := providerIDRegexp.FindStringSubmatch(providerID)
-	if len(matches) != 2 {
-		return "", fmt.Errorf("ProviderID \"%s\" didn't match expected format \"openstack:///InstanceID\"", providerID)
-	}
-	return matches[1], nil
-}
-
-// AddToNodeAddresses appends the NodeAddresses to the passed-by-pointer slice,
-// only if they do not already exist
-func AddToNodeAddresses(addresses *[]v1.NodeAddress, addAddresses ...v1.NodeAddress) {
-	for _, add := range addAddresses {
-		exists := false
-		for _, existing := range *addresses {
-			if existing.Address == add.Address && existing.Type == add.Type {
-				exists = true
-				break
-			}
-		}
-		if !exists {
-			*addresses = append(*addresses, add)
-		}
-	}
-}
-
-// RemoveFromNodeAddresses removes the NodeAddresses from the passed-by-pointer
-// slice if they already exist.
-func RemoveFromNodeAddresses(addresses *[]v1.NodeAddress, removeAddresses ...v1.NodeAddress) {
-	var indexesToRemove []int
-	for _, remove := range removeAddresses {
-		for i := len(*addresses) - 1; i >= 0; i-- {
-			existing := (*addresses)[i]
-			if existing.Address == remove.Address && (existing.Type == remove.Type || remove.Type == "") {
-				indexesToRemove = append(indexesToRemove, i)
-			}
-		}
-	}
-	for _, i := range indexesToRemove {
-		if i < len(*addresses) {
-			*addresses = append((*addresses)[:i], (*addresses)[i+1:]...)
-		}
-	}
 }

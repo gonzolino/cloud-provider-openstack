@@ -10,6 +10,8 @@
     - [Creating Service by specifying a floating IP](#creating-service-by-specifying-a-floating-ip)
     - [Restrict Access For LoadBalancer Service](#restrict-access-for-loadbalancer-service)
     - [Use PROXY protocol to preserve client IP](#use-proxy-protocol-to-preserve-client-ip)
+    - [Sharing load balancer with multiple Services](#sharing-load-balancer-with-multiple-services)
+    - [IPv4 / IPv6 dual-stack services](#ipv4--ipv6-dual-stack-services)
 
 <!-- END doctoc generated TOC please keep comment here to allow auto update -->
 
@@ -18,6 +20,8 @@
 This page shows how to create Services of LoadBalancer type in Kubernetes cluster which is running inside OpenStack. For an explanation of the Service concept and a discussion of the various types of Services, see [Services](https://kubernetes.io/docs/concepts/services-networking/service/).
 
 A LoadBalancer type Service is a typical way to expose an application to the internet. It relies on the cloud provider to create an external load balancer with an IP address in the relevant network space. Any traffic that is then directed to this IP address is forwarded on to the application’s service.
+
+**NOTE: for test/PoC with only 1 master node environment, you need remove the label `node.kubernetes.io/exclude-from-external-load-balancers` of the master node otherwise the loadbalancer will not be created. Refer to [here](https://kubernetes.io/docs/reference/labels-annotations-taints/#node-kubernetes-io-exclude-from-external-load-balancers) for further information.**
 
 > Note: Different cloud providers may support different Service annotations and features.
 
@@ -29,7 +33,7 @@ Create an application of Deployment as the Service backend:
 kubectl run echoserver --image=gcr.io/google-containers/echoserver:1.10 --port=8080
 ```
 
-To provide the echoserver application with an internet-facing loadbalancer we can simply run the following:
+To provide the echoserver application with an internet-facing loadbalancer, we can simply run the following:
 
 ```shell
 cat <<EOF | kubectl apply -f -
@@ -49,7 +53,7 @@ spec:
 EOF
 ```
 
-Check the state the status of the loadbalanced-service until the `EXTERNAL-IP` status is no longer pending.
+Check the state and status of the loadbalanced-service until the `EXTERNAL-IP` status is no longer pending.
 
 ```shell
 $ kubectl get service loadbalanced-service
@@ -98,17 +102,21 @@ Request Body:
 
   This annotation is the ID of a subnet belonging to the floating network, if specified, it takes precedence over `loadbalancer.openstack.org/floating-subnet` or `loadbalancer.openstack.org/floating-tag`.
 
-- `loadbalancer.openstack.org/floating-subnet-tag`
+- `loadbalancer.openstack.org/floating-subnet-tags`
 
   This annotation is the tag of a subnet belonging to the floating network.
-  
+
 - `loadbalancer.openstack.org/class`
 
-  The name of a preconfigured class in the config file. If provided, this config options included in the class section take precedence over the annotations of floating-subnet-id and floating-network-id. See the section below for how it works.
+  The name of a preconfigured class in the config file. If provided, this config options included in the class section take precedence over the annotations of floating-subnet-id, floating-network-id, network-id, subnet-id and member-subnet-id . See the section below for how it works.
 
 - `loadbalancer.openstack.org/subnet-id`
 
   VIP subnet ID of load balancer created.
+
+- `loadbalancer.openstack.org/member-subnet-id`
+
+  Member subnet ID of the load balancer created.
 
 - `loadbalancer.openstack.org/network-id`
 
@@ -128,7 +136,13 @@ Request Body:
 
 - `loadbalancer.openstack.org/proxy-protocol`
 
-  If 'true', the loadbalancer pool protocol will be set as `PROXY`. Default is 'false'.
+  Enable the ProxyProtocol on all listeners. Default is 'false'.
+
+  Values:
+  - `v1`, `true`: enable the ProxyProtocol version 1
+  - `v2`: enable the ProxyProtocol version 2
+
+  Not supported when `lb-provider=ovn` is configured in openstack-cloud-controller-manager.
 
 - `loadbalancer.openstack.org/x-forwarded-for`
 
@@ -136,21 +150,39 @@ Request Body:
 
   This annotation also works in conjunction with the `loadbalancer.openstack.org/default-tls-container-ref` annotation. In this case the cloud provider will create an Octavia listener of type `TERMINATED_HTTPS` instead of an `HTTP` listener.
 
+  Not supported when `lb-provider=ovn` is configured in openstack-cloud-controller-manager.
+
+- `loadbalancer.openstack.org/lb-method`
+
+  Load balancing algorithm to use when distributed to members. [OpenStack Pool Creation | lb_algorithm](https://docs.openstack.org/api-ref/load-balancer/v2/#create-pool)
+
+  Default value: defined in your OCCM configuration
+
+  Possible values: `ROUND_ROBIN`, `LEAST_CONNECTIONS`, `SOURCE_IP`, `SOURCE_IP_PORT`
+
 - `loadbalancer.openstack.org/timeout-client-data`
 
   Frontend client inactivity timeout in milliseconds for the load balancer.
+
+  Not supported when `lb-provider=ovn` is configured in openstack-cloud-controller-manager.
 
 - `loadbalancer.openstack.org/timeout-member-connect`
 
   Backend member connection timeout in milliseconds for the load balancer.
 
+  Not supported when `lb-provider=ovn` is configured in openstack-cloud-controller-manager.
+
 - `loadbalancer.openstack.org/timeout-member-data`
 
   Backend member inactivity timeout in milliseconds for the load balancer.
 
+  Not supported when `lb-provider=ovn` is configured in openstack-cloud-controller-manager.
+
 - `loadbalancer.openstack.org/timeout-tcp-inspect`
 
   Time to wait for additional TCP packets for content inspection in milliseconds for the load balancer.
+
+  Not supported when `lb-provider=ovn` is configured in openstack-cloud-controller-manager.
 
 - `service.beta.kubernetes.io/openstack-internal-load-balancer`
 
@@ -158,20 +190,87 @@ Request Body:
 
 - `loadbalancer.openstack.org/enable-health-monitor`
 
-  Defines whether or not to create health monitor for the load balancer pool, if not specified, use `create-monitor` config. The health monitor can be created or deleted dynamically.
-  
+  Defines whether to create health monitor for the load balancer pool, if not specified, use `create-monitor` config. The health monitor can be created or deleted dynamically. A health monitor is required for services with `externalTrafficPolicy: Local`.
+
+  NOTE: Health monitors for the `ovn` provider are only supported on OpenStack Wallaby and later.
+
+- `loadbalancer.openstack.org/health-monitor-delay`
+
+  Defines the health monitor delay in seconds for the loadbalancer pools.
+
+- `loadbalancer.openstack.org/health-monitor-timeout`
+
+  Defines the health monitor timeout in seconds for the loadbalancer pools. This value should be less than delay
+
+- `loadbalancer.openstack.org/health-monitor-max-retries`
+
+  Defines the health monitor retry count for the loadbalancer pool members.
+
+- `loadbalancer.openstack.org/health-monitor-max-retries-down`
+
+  Defines the health monitor retry count for the loadbalancer pool members to be marked down.
+
 - `loadbalancer.openstack.org/flavor-id`
 
   The id of the flavor that is used for creating the loadbalancer.
+
+  Not supported when `lb-provider=ovn` is configured in openstack-cloud-controller-manager.
 
 - `loadbalancer.openstack.org/availability-zone`
 
   The name of the loadbalancer availability zone to use. It is ignored if the Octavia version doesn't support availability zones yet.
 
+  Not supported when `lb-provider=ovn` is configured in openstack-cloud-controller-manager.
+
 - `loadbalancer.openstack.org/default-tls-container-ref`
 
   Reference to a tls container. This option works with Octavia, when this option is set then the cloud provider will create an Octavia Listener of type `TERMINATED_HTTPS` for a TLS Terminated loadbalancer.
   Format for tls container ref: `https://{keymanager_host}/v1/containers/{uuid}`
+
+  When `container-store` parameter is set to `external` format for `default-tls-container-ref` could be any string.
+
+  Not supported when `lb-provider=ovn` is configured in openstack-cloud-controller-manager.
+
+- `loadbalancer.openstack.org/load-balancer-id`
+
+  This annotation is automatically added to the Service if it's not specified when creating. After the Service is created successfully it shouldn't be changed, otherwise the Service won't behave as expected.
+
+  If this annotation is specified with a valid cloud load balancer ID when creating Service, the Service is reusing this load balancer rather than creating another one. Again, it shouldn't be changed after the Service is created.
+
+  If this annotation is specified, the other annotations which define the load balancer features will be ignored.
+
+- `loadbalancer.openstack.org/load-balancer-tags`
+
+  A comma-separated list of tags to add to the load balancer resource in addition to the tags managed by OCCM. Example: `env=prod,team=network`.
+
+  > NOTE: Tags starting with `kube_service_` are reserved for OCCM's own ownership and shared-load-balancer tracking. Any such tag supplied through this annotation is ignored (a warning is logged) to avoid conflicting with the tags OCCM manages. This applies to all three tag annotations.
+
+- `loadbalancer.openstack.org/listener-tags`
+
+  A comma-separated list of tags to add to the load balancer listener resources in addition to the tags managed by OCCM. Example: `env=prod,team=network`. Tags starting with the reserved `kube_service_` prefix are ignored (see the note above).
+
+- `loadbalancer.openstack.org/pool-tags`
+
+  A comma-separated list of tags to add to the load balancer pool resources. Example: `env=prod,team=network`. Tags starting with the reserved `kube_service_` prefix are ignored (see the note above).
+
+- `loadbalancer.openstack.org/hostname`
+
+  This annotations explicitly sets a hostname in the status of the load balancer service.
+
+- `loadbalancer.openstack.org/enable-ingress-hostname`
+
+  Defines whether the load balancer address is published in the service status as a `<ip>.<suffix>` hostname when the PROXY protocol is enabled, if not specified, use [`enable-ingress-hostname`](./using-openstack-cloud-controller-manager.md#load-balancer) config. Set to `false` to publish the IP address with `ipMode: Proxy` instead, which lets DNS integrations create A records for the service.
+
+- `loadbalancer.openstack.org/load-balancer-address`
+  
+  This annotation is automatically added and it contains the floating ip address of the load balancer service.
+  When using `loadbalancer.openstack.org/hostname` annotation it is the only place to see the real address of the load balancer.
+
+- `loadbalancer.openstack.org/node-selector`
+
+  A set of key=value annotations used to filter nodes for targeting by the load balancer. When defined, only nodes that match all the specified key=value annotations will be targeted. If an annotation includes only a key without a value, the filter will check only for the existence of the key on the node. If the value is not set, the `node-selector` value defined in the OCCM configuration is applied.
+
+  Example: To filter nodes with the labels `env=production` and `region=default`, set the `loadbalancer.openstack.org/node-selector` annotation to `env=production, region=default`
 
 ### Switching between Floating Subnets by using preconfigured Classes
 
@@ -190,14 +289,14 @@ username="myuser"
 password="mypassword"
 
 [LoadBalancer]
-use-octavia=true
 floating-network-id="a57af0a0-da92-49be-a98a-345ceca004b3"
 floating-subnet-id="a02eb6c3-fc69-46ae-a3fe-fb43c1563cbc"
 subnet-id="fa6a4e6c-6ae4-4dde-ae86-3e2f452c1f03"
 create-monitor=true
 monitor-delay=60s
 monitor-timeout=30s
-monitor-max-retries=5
+monitor-max-retries=1
+monitor-max-retries-down=3
 
 [LoadBalancerClass "internetFacing"]
 floating-network-id="c57af0a0-da92-49be-a98a-345ceca004b3"
@@ -212,7 +311,7 @@ floating-subnet-id="b374bed4-e920-4c40-b646-2d8927f7f67b"
 
 Within a `LoadBalancerClass` one of `floating-subnet-id`, `floating-subnet` or `floating-subnet-tags` is mandatory.
 `floating-subnet-id` takes precedence over the other ones with must all match if specified.
-If the pattern starts with a `!`, the match is negated. 
+If the pattern starts with a `!`, the match is negated.
 The rest of the pattern can either be a direct name, a glob or a regular expression if it starts with a `~`.
 `floating-subnet-tags` can be a comma separated list of tags. By default it matches a subnet if at least one tag is present.
 If the list is preceded by a `&` all tags must be present. Again with a preceding `!` the condition be be negated.
@@ -293,7 +392,9 @@ This requires that not only the proxy server(e.g. NGINX) should support PROXY pr
 
 This guide uses nginx-ingress-controller as an example.
 
-To enable PROXY protocol support, the openstack-cloud-controller-manager config option [enable-ingress-hostname](./using-openstack-cloud-controller-manager.md#load-balancer) should set to `true`.
+Since Kubernetes 1.32, PROXY protocol support needs no extra configuration: openstack-cloud-controller-manager publishes the load balancer IP with `ipMode: Proxy`, so kube-proxy does not intercept traffic to it. If the config option [enable-ingress-hostname](./using-openstack-cloud-controller-manager.md#load-balancer) is set to `true` cluster-wide, a service can still get the IP by opting out with the annotation `loadbalancer.openstack.org/enable-ingress-hostname: "false"`.
+
+Prior to this, either the config option `enable-ingress-hostname` should be set to `true` or an explicit hostname should be set on the load balancer service via the [annotation](./expose-applications-using-loadbalancer-type-service.md#service-annotations) `loadbalancer.openstack.org/hostname`.
 
 1. Set up the nginx-ingress-controller
 
@@ -333,6 +434,8 @@ To enable PROXY protocol support, the openstack-cloud-controller-manager config 
        app: nginx-ingress
    ```
 
+> To use the ProxyProtocol's version 2, set the annotation's value to `v2`. By default, ProxyProtocol's version 1 is used.
+
    Wait until the service gets an external IP.
 
    ```bash
@@ -369,9 +472,9 @@ To enable PROXY protocol support, the openstack-cloud-controller-manager config 
            ports:
              - containerPort: 8080
    EOF
-   
+
    $ kubectl expose deployment echoserver --type=ClusterIP --target-port=8080
-   
+
    $ cat <<EOF | kubectl apply -f -
    apiVersion: networking.k8s.io/v1
    kind: Ingress
@@ -393,7 +496,7 @@ To enable PROXY protocol support, the openstack-cloud-controller-manager config 
                  port:
                    number: 80
    EOF
-   
+
    $ kubectl get ing
    NAME                   CLASS    HOSTS      ADDRESS                 PORTS   AGE
    test-proxy-protocol    <none>   test.com   103.250.240.24.nip.io   80      58m
@@ -430,3 +533,134 @@ To enable PROXY protocol support, the openstack-cloud-controller-manager config 
    Request Body:
            -no body in request-
    ```
+
+> Note: the Proxy Protocol is only available with TCP services.
+
+### Sharing load balancer with multiple Services
+
+By default, different Services of LoadBalancer type should have different corresponding cloud load balancers, however, openstack-cloud-controller-manager allows multiple Services to share a single load balancer if the Octavia service supports the tag feature (since API version 2.5).
+
+The shared load balancer can be created either by other Services or outside the cluster, e.g. created manually by the user in the cloud or by Services from the other Kubernetes clusters. The load balancer is deleted only when the last attached Service is deleted, unless the load balancer was created outside the Kubernetes cluster. 
+
+All Services attached to one shared load balancer will have the same external IP as the floating IP and LB VIP are shared too.
+
+The maximum number of Services that share a load balancer can be configured in `[LoadBalancer] max-shared-lb`, default value is 2. The ports of those Services shouldn't have collisions.
+
+In order to prevent accidental exposure internal Services cannot share a load balancer with any other Service. This means that cloud provider will prevent creation of a secondary internal Service sharing a load balancer with either external or internal Service. This is because floating IPs are attached to the load balancer and not to the listener.
+
+For example, create a Service `service-1` as before:
+
+```yaml
+kind: Service
+apiVersion: v1
+metadata:
+  name: service-1
+  namespace: default
+spec:
+  type: LoadBalancer
+  selector:
+    app: webserver
+  ports:
+    - protocol: TCP
+      port: 80
+      targetPort: 8080
+```
+
+When `service-1` is created successfully, check the load balancer created in the cloud, which has its name in its tags.
+
+```shell
+$ openstack loadbalancer show 2b224530-9414-4302-8163-5abebdcdc84f -c name -c tags
++-------+---------------------------------------------+
+| Field | Value                                       |
++-------+---------------------------------------------+
+| name  | kube_service_cluster-name_default_service-1 |
+| tags  | kube_service_cluster-name_default_service-1 |
++-------+---------------------------------------------+
+```
+
+Check the Service, you should notice a new annotation `loadbalancer.openstack.org/load-balancer-id` is added:
+
+```shell
+$ kubectl describe service service-1 | grep loadbalancer.openstack.org/load-balancer-id
+                          loadbalancer.openstack.org/load-balancer-id: 2b224530-9414-4302-8163-5abebdcdc84f
+```
+
+> NOTE: Do not update the annotation `loadbalancer.openstack.org/load-balancer-id` after the Service is created successfully or the relationship between Service and the load balancer will be broken.
+
+Now, create another Service `service-2` but re-use the load balancer created for `service-1` by specifying the annotation `loadbalancer.openstack.org/load-balancer-id`:
+
+```yaml
+kind: Service
+apiVersion: v1
+metadata:
+  name: service-2
+  namespace: default
+  annotations:
+    loadbalancer.openstack.org/load-balancer-id: "2b224530-9414-4302-8163-5abebdcdc84f"
+spec:
+  type: LoadBalancer
+  selector:
+    app: webserver
+  ports:
+    - protocol: TCP
+      port: 8080
+      targetPort: 8080
+```
+
+After `service-2` is created successfully, check the load balancer again, you'll see there is a new tag added. Now the load balancer should have 2 listeners, listening on the ports of the 2 Services respectively.
+
+```shell
+$ openstack loadbalancer show 2b224530-9414-4302-8163-5abebdcdc84f -c name -c tags
++-------+---------------------------------------------+
+| Field | Value                                       |
++-------+---------------------------------------------+
+| name  | kube_service_lingxian-k8s_default_service-1 |
+| tags  | kube_service_lingxian-k8s_default_service-1 |
+|       | kube_service_lingxian-k8s_default_service-2 |
++-------+---------------------------------------------+
+$ openstack loadbalancer listener list --loadbalancer 2b224530-9414-4302-8163-5abebdcdc84f -c id -c protocol -c protocol_port
++--------------------------------------+----------+---------------+
+| id                                   | protocol | protocol_port |
++--------------------------------------+----------+---------------+
+| 05fbcc93-61e5-4eb4-be21-632ab8022d46 | TCP      |            80 |
+| 50e94cc4-f08e-4c71-9ee4-4488350834f6 | TCP      |          8080 |
++--------------------------------------+----------+---------------+
+```
+
+Check the load balancer again after deleting `service-1`:
+
+```shell
+$ openstack loadbalancer show 2b224530-9414-4302-8163-5abebdcdc84f -c name -c tags
++-------+---------------------------------------------+
+| Field | Value                                       |
++-------+---------------------------------------------+
+| name  | kube_service_lingxian-k8s_default_service-1 |
+| tags  | kube_service_lingxian-k8s_default_service-2 |
++-------+---------------------------------------------+
+$ openstack loadbalancer listener list --loadbalancer 2b224530-9414-4302-8163-5abebdcdc84f -c id -c protocol -c protocol_port
++--------------------------------------+----------+---------------+
+| id                                   | protocol | protocol_port |
++--------------------------------------+----------+---------------+
+| 50e94cc4-f08e-4c71-9ee4-4488350834f6 | TCP      |          8080 |
++--------------------------------------+----------+---------------+
+```
+
+The load balancer will be deleted after `service-2` is deleted.
+
+### IPv4 / IPv6 dual-stack services
+Since Kubernetes 1.20, Kubernetes clusters can run in dual-stack mode,
+which allows simultaneous usage of both IPv4 and IPv6 addresses in the cluster.
+In dual-stack clusters, services can use IPv4, IPv6, or both address families, which
+can be indicated in service's `spec.ipFamilies`.
+
+If only one address family is specified in service's `spec.ipFamilies`, OCCM will respect
+that and create an IPv4 or IPv6 load balancer based on that.
+
+If two address families are specified in service's `spec.ipFamilies`, OCCM will respect the
+specified order and create an IPv4 or IPv6 load balancer based on the first specified address
+family. Note that creation of two load balancers for services with two `spec.ipFamilies`
+is not yet supported by OCCM.
+
+Internally, OCCM would automatically look for IPv4 or IPv6 subnet to allocate the load balancer
+address from based on the service's address family preference. If the subnet with preferred
+address family is not available, load balancer can not be created.

@@ -17,10 +17,11 @@ limitations under the License.
 package manila
 
 import (
+	"context"
 	"fmt"
 	"time"
 
-	"github.com/gophercloud/gophercloud/openstack/sharedfilesystems/v2/snapshots"
+	"github.com/gophercloud/gophercloud/v2/openstack/sharedfilesystems/v2/snapshots"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/cloud-provider-openstack/pkg/csi/manila/manilaclient"
 	clouderrors "k8s.io/cloud-provider-openstack/pkg/util/errors"
@@ -28,18 +29,17 @@ import (
 )
 
 const (
-	snapshotCreating      = "creating"
-	snapshotDeleting      = "deleting"
-	snapshotError         = "error"
-	snapshotErrorDeleting = "error_deleting"
-	snapshotAvailable     = "available"
+	snapshotCreating  = "creating"
+	snapshotDeleting  = "deleting"
+	snapshotError     = "error"
+	snapshotAvailable = "available"
 
 	snapshotDescription = "snapshotted-by=manila.csi.openstack.org"
 )
 
 // getOrCreateSnapshot retrieves an existing snapshot with name=snapName, or creates a new one if it doesn't exist yet.
 // Instead of waiting for the snapshot to become available (as getOrCreateShare does), CSI's ready_to_use flag is used to signal readiness
-func getOrCreateSnapshot(snapName, sourceShareID string, manilaClient manilaclient.Interface) (*snapshots.Snapshot, error) {
+func getOrCreateSnapshot(ctx context.Context, manilaClient manilaclient.Interface, snapName, sourceShareID string) (*snapshots.Snapshot, error) {
 	var (
 		snapshot *snapshots.Snapshot
 		err      error
@@ -47,7 +47,7 @@ func getOrCreateSnapshot(snapName, sourceShareID string, manilaClient manilaclie
 
 	// First, check if the snapshot already exists or needs to be created
 
-	if snapshot, err = manilaClient.GetSnapshotByName(snapName); err != nil {
+	if snapshot, err = manilaClient.GetSnapshotByName(ctx, snapName); err != nil {
 		if clouderrors.IsNotFound(err) {
 			// It doesn't exist, create it
 
@@ -58,7 +58,7 @@ func getOrCreateSnapshot(snapName, sourceShareID string, manilaClient manilaclie
 			}
 
 			var createErr error
-			if snapshot, createErr = manilaClient.CreateSnapshot(opts); createErr != nil {
+			if snapshot, createErr = manilaClient.CreateSnapshot(ctx, opts); createErr != nil {
 				return nil, createErr
 			}
 
@@ -73,8 +73,8 @@ func getOrCreateSnapshot(snapName, sourceShareID string, manilaClient manilaclie
 	return snapshot, nil
 }
 
-func deleteSnapshot(snapID string, manilaClient manilaclient.Interface) error {
-	if err := manilaClient.DeleteSnapshot(snapID); err != nil {
+func deleteSnapshot(ctx context.Context, manilaClient manilaclient.Interface, snapID string) error {
+	if err := manilaClient.DeleteSnapshot(ctx, snapID); err != nil {
 		if clouderrors.IsNotFound(err) {
 			klog.V(4).Infof("snapshot %s not found, assuming it to be already deleted", snapID)
 		} else {
@@ -85,24 +85,24 @@ func deleteSnapshot(snapID string, manilaClient manilaclient.Interface) error {
 	return nil
 }
 
-func tryDeleteSnapshot(snapshot *snapshots.Snapshot, manilaClient manilaclient.Interface) {
+func tryDeleteSnapshot(ctx context.Context, manilaClient manilaclient.Interface, snapshot *snapshots.Snapshot) {
 	if snapshot == nil {
 		return
 	}
 
-	if err := deleteSnapshot(snapshot.ID, manilaClient); err != nil {
+	if err := deleteSnapshot(ctx, manilaClient, snapshot.ID); err != nil {
 		// TODO failure to delete a snapshot in an error state needs proper monitoring support
 		klog.Errorf("couldn't delete snapshot %s in a roll-back procedure: %v", snapshot.ID, err)
 		return
 	}
 
-	_, _, err := waitForSnapshotStatus(snapshot.ID, snapshotDeleting, "", true, manilaClient)
-	if err != nil && err != wait.ErrWaitTimeout {
+	_, _, err := waitForSnapshotStatus(ctx, manilaClient, snapshot.ID, snapshotDeleting, "", true)
+	if err != nil && !wait.Interrupted(err) {
 		klog.Errorf("couldn't retrieve snapshot %s in a roll-back procedure: %v", snapshot.ID, err)
 	}
 }
 
-func waitForSnapshotStatus(snapshotID, currentStatus, desiredStatus string, successOnNotFound bool, manilaClient manilaclient.Interface) (*snapshots.Snapshot, manilaError, error) {
+func waitForSnapshotStatus(ctx context.Context, manilaClient manilaclient.Interface, snapshotID, currentStatus, desiredStatus string, successOnNotFound bool) (*snapshots.Snapshot, manilaError, error) {
 	var (
 		backoff = wait.Backoff{
 			Duration: time.Second * waitForAvailableShareTimeout,
@@ -116,7 +116,7 @@ func waitForSnapshotStatus(snapshotID, currentStatus, desiredStatus string, succ
 	)
 
 	return snapshot, manilaErrCode, wait.ExponentialBackoff(backoff, func() (bool, error) {
-		snapshot, err = manilaClient.GetSnapshotByID(snapshotID)
+		snapshot, err = manilaClient.GetSnapshotByID(ctx, snapshotID)
 
 		if err != nil {
 			if clouderrors.IsNotFound(err) && successOnNotFound {
@@ -134,7 +134,7 @@ func waitForSnapshotStatus(snapshotID, currentStatus, desiredStatus string, succ
 		case desiredStatus:
 			isAvailable = true
 		case shareError:
-			manilaErrMsg, err := lastResourceError(snapshotID, manilaClient)
+			manilaErrMsg, err := lastResourceError(ctx, manilaClient, snapshotID)
 			if err != nil {
 				return false, fmt.Errorf("snapshot %s is in error state, error description could not be retrieved: %v", snapshotID, err)
 			}

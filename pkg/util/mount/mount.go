@@ -18,7 +18,6 @@ package mount
 
 import (
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path"
 	"strings"
@@ -50,6 +49,7 @@ type IMount interface {
 	MakeFile(pathname string) error
 	MakeDir(pathname string) error
 	GetDeviceStats(path string) (*DeviceStats, error)
+	GetMountFs(path string) ([]byte, error)
 }
 
 type DeviceStats struct {
@@ -69,7 +69,7 @@ type Mount struct {
 
 var _ IMount = &Mount{}
 
-var MInstance IMount = nil
+var MInstance IMount
 
 func getBaseMounter() *mount.SafeFormatAndMount {
 	nMounter := mount.New("")
@@ -80,7 +80,7 @@ func getBaseMounter() *mount.SafeFormatAndMount {
 	}
 }
 
-//GetMountProvider returns instance of Mounter
+// GetMountProvider returns instance of Mounter
 func GetMountProvider() IMount {
 	if MInstance == nil {
 		MInstance = &Mount{BaseMounter: getBaseMounter()}
@@ -97,11 +97,13 @@ func (m *Mount) Mounter() *mount.SafeFormatAndMount {
 func probeVolume() error {
 	// rescan scsi bus
 	scsiPath := "/sys/class/scsi_host/"
-	if dirs, err := ioutil.ReadDir(scsiPath); err == nil {
+	if dirs, err := os.ReadDir(scsiPath); err == nil {
 		for _, f := range dirs {
 			name := scsiPath + f.Name() + "/scan"
 			data := []byte("- - -")
-			ioutil.WriteFile(name, data, 0666)
+			if err := os.WriteFile(name, data, 0666); err != nil {
+				return fmt.Errorf("unable to scan %s: %w", f.Name(), err)
+			}
 		}
 	}
 
@@ -131,14 +133,17 @@ func (m *Mount) GetDevicePath(volumeID string) (string, error) {
 			return true, nil
 		}
 		// see issue https://github.com/kubernetes/cloud-provider-openstack/issues/705
-		probeVolume()
+		if err := probeVolume(); err != nil {
+			// log the error, but continue. Might not happen in edge cases
+			klog.V(5).Infof("Unable to probe attached disk: %v", err)
+		}
 		return false, nil
 	})
 
-	if err == wait.ErrWaitTimeout {
-		return "", fmt.Errorf("Failed to find device for the volumeID: %q within the alloted time", volumeID)
+	if wait.Interrupted(err) {
+		return "", fmt.Errorf("failed to find device for the volumeID: %q within the alloted time", volumeID)
 	} else if devicePath == "" {
-		return "", fmt.Errorf("Device path was empty for volumeID: %q", volumeID)
+		return "", fmt.Errorf("device path was empty for volumeID: %q", volumeID)
 	}
 	return devicePath, nil
 }
@@ -157,10 +162,10 @@ func (m *Mount) getDevicePathBySerialID(volumeID string) string {
 		// KVM virtio-scsi #852
 		fmt.Sprintf("scsi-0QEMU_QEMU_HARDDISK_%s", volumeID),
 		// ESXi
-		fmt.Sprintf("wwn-0x%s", strings.Replace(volumeID, "-", "", -1)),
+		fmt.Sprintf("wwn-0x%s", strings.ReplaceAll(volumeID, "-", "")),
 	}
 
-	files, err := ioutil.ReadDir("/dev/disk/by-id/")
+	files, err := os.ReadDir("/dev/disk/by-id/")
 	if err != nil {
 		klog.V(4).Infof("ReadDir failed with error %v", err)
 	}
@@ -190,7 +195,10 @@ func (m *Mount) ScanForAttach(devicePath string) error {
 		select {
 		case <-ticker.C:
 			klog.V(5).Infof("Checking Cinder disk %q is attached.", devicePath)
-			probeVolume()
+			if err := probeVolume(); err != nil {
+				// log the error, but continue. Might not happen in edge cases
+				klog.V(5).Infof("Unable to probe attached disk: %v", err)
+			}
 
 			exists, err := mount.PathExists(devicePath)
 			if exists && err == nil {
@@ -198,7 +206,7 @@ func (m *Mount) ScanForAttach(devicePath string) error {
 			}
 			klog.V(3).Infof("Could not find attached Cinder disk %s", devicePath)
 		case <-timer.C:
-			return fmt.Errorf("Could not find attached Cinder disk %s. Timeout waiting for mount paths to be created.", devicePath)
+			return fmt.Errorf("could not find attached Cinder disk %s. Timeout waiting for mount paths to be created", devicePath)
 		}
 	}
 }
@@ -215,6 +223,11 @@ func (m *Mount) IsLikelyNotMountPointAttach(targetpath string) (bool, error) {
 		}
 	}
 	return notMnt, err
+}
+
+func (m *Mount) GetMountFs(volumePath string) ([]byte, error) {
+	args := []string{"-o", "source", "--first-only", "--noheadings", "--target", volumePath}
+	return m.BaseMounter.Exec.Command("findmnt", args...).CombinedOutput()
 }
 
 // UnmountPath
@@ -236,7 +249,7 @@ func (m *Mount) MakeDir(pathname string) error {
 // MakeFile creates an empty file
 func (m *Mount) MakeFile(pathname string) error {
 	f, err := os.OpenFile(pathname, os.O_CREATE, os.FileMode(0644))
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	if err != nil {
 		if !os.IsExist(err) {
 			return err
@@ -247,6 +260,9 @@ func (m *Mount) MakeFile(pathname string) error {
 
 func (m *Mount) GetDeviceStats(path string) (*DeviceStats, error) {
 	isBlock, err := blockdevice.IsBlockDevice(path)
+	if err != nil {
+		return nil, err
+	}
 
 	if isBlock {
 		size, err := blockdevice.GetBlockDeviceSize(path)

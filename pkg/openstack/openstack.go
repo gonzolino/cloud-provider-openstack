@@ -18,34 +18,33 @@ package openstack
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
-	"net"
 	"os"
-	"regexp"
-	"sort"
-	"strings"
+	"slices"
 	"time"
 
-	"github.com/gophercloud/gophercloud"
-	"github.com/gophercloud/gophercloud/openstack/compute/v2/extensions/attachinterfaces"
-	"github.com/gophercloud/gophercloud/openstack/compute/v2/extensions/availabilityzones"
-	"github.com/gophercloud/gophercloud/openstack/compute/v2/servers"
-	"github.com/gophercloud/gophercloud/pagination"
-	"github.com/mitchellh/mapstructure"
+	"github.com/gophercloud/gophercloud/v2"
+	"github.com/gophercloud/gophercloud/v2/openstack/networking/v2/extensions/portsecurity"
+	"github.com/gophercloud/gophercloud/v2/openstack/networking/v2/extensions/trunk_details"
+	neutronports "github.com/gophercloud/gophercloud/v2/openstack/networking/v2/ports"
 	"github.com/spf13/pflag"
 	gcfg "gopkg.in/gcfg.v1"
+	"k8s.io/client-go/kubernetes"
+	cloudprovider "k8s.io/cloud-provider"
+	"k8s.io/klog/v2"
 
 	v1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/types"
-	cloudprovider "k8s.io/cloud-provider"
+	"k8s.io/client-go/informers"
+	coreinformers "k8s.io/client-go/informers/core/v1"
+	"k8s.io/client-go/kubernetes/scheme"
+	v1core "k8s.io/client-go/kubernetes/typed/core/v1"
+	"k8s.io/client-go/tools/record"
 	"k8s.io/cloud-provider-openstack/pkg/client"
 	"k8s.io/cloud-provider-openstack/pkg/metrics"
 	"k8s.io/cloud-provider-openstack/pkg/util"
 	"k8s.io/cloud-provider-openstack/pkg/util/metadata"
-	"k8s.io/klog/v2"
+	openstackutil "k8s.io/cloud-provider-openstack/pkg/util/openstack"
 )
 
 const (
@@ -53,69 +52,77 @@ const (
 	ProviderName = "openstack"
 
 	// TypeHostName is the name type of openstack instance
-	TypeHostName     = "hostname"
-	availabilityZone = "availability_zone"
-	defaultTimeOut   = 60 * time.Second
+	TypeHostName   = "hostname"
+	defaultTimeOut = 60 * time.Second
 )
-
-// ErrNotFound is used to inform that the object is missing
-var ErrNotFound = errors.New("failed to find object")
-
-// ErrMultipleResults is used when we unexpectedly get back multiple results
-var ErrMultipleResults = errors.New("multiple results where only one expected")
-
-// ErrNoAddressFound is used when we cannot find an ip address for the host
-var ErrNoAddressFound = errors.New("no address found for host")
-
-// ErrIPv6SupportDisabled is used when one tries to use IPv6 Addresses when
-// IPv6 support is disabled by config
-var ErrIPv6SupportDisabled = errors.New("IPv6 support is disabled")
 
 // userAgentData is used to add extra information to the gophercloud user-agent
 var userAgentData []string
 
 // supportedLBProvider map is used to define LoadBalancer providers that we support
-var supportedLBProvider = []string{"amphora", "octavia"}
+var supportedLBProvider = []string{"amphora", "octavia", "ovn", "f5", "amphorav2"}
+
+// supportedContainerStore map is used to define supported tls-container-ref store
+var supportedContainerStore = []string{"barbican", "external"}
 
 // AddExtraFlags is called by the main package to add component specific command line flags
 func AddExtraFlags(fs *pflag.FlagSet) {
 	fs.StringArrayVar(&userAgentData, "user-agent", nil, "Extra data to add to gophercloud user-agent. Use multiple times to add more than one component.")
 }
 
+type PortWithTrunkDetails struct {
+	neutronports.Port
+	trunk_details.TrunkDetailsExt
+}
+
+type PortWithPortSecurity struct {
+	neutronports.Port
+	portsecurity.PortSecurityExt
+}
+
 // LoadBalancer is used for creating and maintaining load balancers
 type LoadBalancer struct {
-	secret  *gophercloud.ServiceClient
-	network *gophercloud.ServiceClient
-	compute *gophercloud.ServiceClient
-	lb      *gophercloud.ServiceClient
-	opts    LoadBalancerOpts
+	secret        *gophercloud.ServiceClient
+	network       *gophercloud.ServiceClient
+	lb            *gophercloud.ServiceClient
+	opts          LoadBalancerOpts
+	kclient       kubernetes.Interface
+	eventRecorder record.EventRecorder
 }
 
 // LoadBalancerOpts have the options to talk to Neutron LBaaSV2 or Octavia
 type LoadBalancerOpts struct {
-	LBVersion             string              `gcfg:"lb-version"`           // overrides autodetection. Only support v2.
-	UseOctavia            bool                `gcfg:"use-octavia"`          // uses Octavia V2 service catalog endpoint
-	SubnetID              string              `gcfg:"subnet-id"`            // overrides autodetection.
-	NetworkID             string              `gcfg:"network-id"`           // If specified, will create virtual ip from a subnet in network which has available IP addresses
-	FloatingNetworkID     string              `gcfg:"floating-network-id"`  // If specified, will create floating ip for loadbalancer, or do not create floating ip.
-	FloatingSubnetID      string              `gcfg:"floating-subnet-id"`   // If specified, will create floating ip for loadbalancer in this particular floating pool subnetwork.
-	FloatingSubnet        string              `gcfg:"floating-subnet"`      // If specified, will create floating ip for loadbalancer in one of the matching floating pool subnetworks.
-	FloatingSubnetTags    string              `gcfg:"floating-subnet-tags"` // If specified, will create floating ip for loadbalancer in one of the matching floating pool subnetworks.
-	LBClasses             map[string]*LBClass // Predefined named Floating networks and subnets
-	LBMethod              string              `gcfg:"lb-method"` // default to ROUND_ROBIN.
-	LBProvider            string              `gcfg:"lb-provider"`
-	CreateMonitor         bool                `gcfg:"create-monitor"`
-	MonitorDelay          util.MyDuration     `gcfg:"monitor-delay"`
-	MonitorTimeout        util.MyDuration     `gcfg:"monitor-timeout"`
-	MonitorMaxRetries     uint                `gcfg:"monitor-max-retries"`
-	ManageSecurityGroups  bool                `gcfg:"manage-security-groups"`
-	NodeSecurityGroupIDs  []string            // Do not specify, get it automatically when enable manage-security-groups. TODO(FengyunPan): move it into cache
-	InternalLB            bool                `gcfg:"internal-lb"`    // default false
-	CascadeDelete         bool                `gcfg:"cascade-delete"` // applicable only if use-octavia is set to True
-	FlavorID              string              `gcfg:"flavor-id"`
-	AvailabilityZone      string              `gcfg:"availability-zone"`
-	EnableIngressHostname bool                `gcfg:"enable-ingress-hostname"`   // Used with proxy protocol by adding a dns suffix to the load balancer IP address. Default false.
-	TlsContainerRef       string              `gcfg:"default-tls-container-ref"` //  reference to a tls container
+	Enabled                        bool                `gcfg:"enabled"`              // if false, disables the controller
+	LBVersion                      string              `gcfg:"lb-version"`           // overrides autodetection. Only support v2.
+	SubnetID                       string              `gcfg:"subnet-id"`            // overrides autodetection.
+	MemberSubnetID                 string              `gcfg:"member-subnet-id"`     // overrides autodetection.
+	NetworkID                      string              `gcfg:"network-id"`           // If specified, will create virtual ip from a subnet in network which has available IP addresses
+	FloatingNetworkID              string              `gcfg:"floating-network-id"`  // If specified, will create floating ip for loadbalancer, or do not create floating ip.
+	FloatingSubnetID               string              `gcfg:"floating-subnet-id"`   // If specified, will create floating ip for loadbalancer in this particular floating pool subnetwork.
+	FloatingSubnet                 string              `gcfg:"floating-subnet"`      // If specified, will create floating ip for loadbalancer in one of the matching floating pool subnetworks.
+	FloatingSubnetTags             string              `gcfg:"floating-subnet-tags"` // If specified, will create floating ip for loadbalancer in one of the matching floating pool subnetworks.
+	LBClasses                      map[string]*LBClass // Predefined named Floating networks and subnets
+	LBMethod                       string              `gcfg:"lb-method"` // default to ROUND_ROBIN.
+	LBProvider                     string              `gcfg:"lb-provider"`
+	CreateMonitor                  bool                `gcfg:"create-monitor"`
+	MonitorDelay                   util.MyDuration     `gcfg:"monitor-delay"`
+	MonitorTimeout                 util.MyDuration     `gcfg:"monitor-timeout"`
+	MonitorMaxRetries              uint                `gcfg:"monitor-max-retries"`
+	MonitorMaxRetriesDown          uint                `gcfg:"monitor-max-retries-down"`
+	ManageSecurityGroups           bool                `gcfg:"manage-security-groups"`
+	InternalLB                     bool                `gcfg:"internal-lb"`   // default false
+	NodeSelector                   string              `gcfg:"node-selector"` // If specified, the loadbalancer members will be assined only from nodes list filtered by node-selector labels
+	CascadeDelete                  bool                `gcfg:"cascade-delete"`
+	FlavorID                       string              `gcfg:"flavor-id"`
+	AvailabilityZone               string              `gcfg:"availability-zone"`
+	EnableIngressHostname          bool                `gcfg:"enable-ingress-hostname"`            // Used with proxy protocol by adding a dns suffix to the load balancer IP address. Default false.
+	IngressHostnameSuffix          string              `gcfg:"ingress-hostname-suffix"`            // Used with proxy protocol by adding a dns suffix to the load balancer IP address. Default nip.io.
+	MaxSharedLB                    int                 `gcfg:"max-shared-lb"`                      //  Number of Services in maximum can share a single load balancer. Default 2
+	ContainerStore                 string              `gcfg:"container-store"`                    // Used to specify the store of the tls-container-ref
+	ProviderRequiresSerialAPICalls bool                `gcfg:"provider-requires-serial-api-calls"` // default false, the provider supports the "bulk update" API call
+	// revive:disable:var-naming
+	TlsContainerRef string `gcfg:"default-tls-container-ref"` //  reference to a tls container
+	// revive:enable:var-naming
 }
 
 // LBClass defines the corresponding floating network, floating subnet or internal subnet ID
@@ -126,13 +133,7 @@ type LBClass struct {
 	FloatingSubnetTags string `gcfg:"floating-subnet-tags,omitempty"`
 	NetworkID          string `gcfg:"network-id,omitempty"`
 	SubnetID           string `gcfg:"subnet-id,omitempty"`
-}
-
-// BlockStorageOpts is used to talk to Cinder service
-type BlockStorageOpts struct {
-	BSVersion       string `gcfg:"bs-version"`        // overrides autodetection. v1 or v2. Defaults to auto
-	TrustDevicePath bool   `gcfg:"trust-device-path"` // See Issue #33128
-	IgnoreVolumeAZ  bool   `gcfg:"ignore-volume-az"`
+	MemberSubnetID     string `gcfg:"member-subnet-id,omitempty"`
 }
 
 // NetworkingOpts is used for networking settings
@@ -140,29 +141,28 @@ type NetworkingOpts struct {
 	IPv6SupportDisabled bool     `gcfg:"ipv6-support-disabled"`
 	PublicNetworkName   []string `gcfg:"public-network-name"`
 	InternalNetworkName []string `gcfg:"internal-network-name"`
+	AddressSortOrder    string   `gcfg:"address-sort-order"`
 }
 
 // RouterOpts is used for Neutron routes
 type RouterOpts struct {
-	RouterID string `gcfg:"router-id"` // required
-}
-
-type ServerAttributesExt struct {
-	servers.Server
-	availabilityzones.ServerAvailabilityZoneExt
+	RouterID string `gcfg:"router-id"`
 }
 
 // OpenStack is an implementation of cloud provider Interface for OpenStack.
 type OpenStack struct {
-	provider       *gophercloud.ProviderClient
-	epOpts         *gophercloud.EndpointOpts
-	lbOpts         LoadBalancerOpts
-	bsOpts         BlockStorageOpts
-	routeOpts      RouterOpts
-	metadataOpts   metadata.MetadataOpts
-	networkingOpts NetworkingOpts
-	// InstanceID of the server where this OpenStack object is instantiated.
-	localInstanceID string
+	provider              *gophercloud.ProviderClient
+	epOpts                *gophercloud.EndpointOpts
+	lbOpts                LoadBalancerOpts
+	routeOpts             RouterOpts
+	metadataOpts          metadata.Opts
+	networkingOpts        NetworkingOpts
+	kclient               kubernetes.Interface
+	nodeInformer          coreinformers.NodeInformer
+	nodeInformerHasSynced func() bool
+
+	eventBroadcaster record.EventBroadcaster
+	eventRecorder    record.EventRecorder
 }
 
 // Config is used to read and store information from the cloud configuration file
@@ -170,14 +170,13 @@ type Config struct {
 	Global            client.AuthOpts
 	LoadBalancer      LoadBalancerOpts
 	LoadBalancerClass map[string]*LBClass
-	BlockStorage      BlockStorageOpts
 	Route             RouterOpts
-	Metadata          metadata.MetadataOpts
+	Metadata          metadata.Opts
 	Networking        NetworkingOpts
 }
 
 func init() {
-	metrics.RegisterMetrics()
+	metrics.RegisterMetrics("occm")
 
 	cloudprovider.RegisterCloudProvider(ProviderName, func(config io.Reader) (cloudprovider.Interface, error) {
 		cfg, err := ReadConfig(config)
@@ -193,6 +192,15 @@ func init() {
 	})
 }
 
+// Initialize passes a Kubernetes clientBuilder interface to the cloud provider
+func (os *OpenStack) Initialize(clientBuilder cloudprovider.ControllerClientBuilder, stop <-chan struct{}) {
+	clientset := clientBuilder.ClientOrDie("cloud-controller-manager")
+	os.kclient = clientset
+	os.eventBroadcaster = record.NewBroadcaster()
+	os.eventBroadcaster.StartRecordingToSink(&v1core.EventSinkImpl{Interface: os.kclient.CoreV1().Events("")})
+	os.eventRecorder = os.eventBroadcaster.NewRecorder(scheme.Scheme, v1.EventSource{Component: "cloud-provider-openstack"})
+}
+
 // ReadConfig reads values from the cloud.conf
 func ReadConfig(config io.Reader) (Config, error) {
 	if config == nil {
@@ -201,8 +209,9 @@ func ReadConfig(config io.Reader) (Config, error) {
 	var cfg Config
 
 	// Set default values explicitly
-	cfg.LoadBalancer.UseOctavia = true
+	cfg.LoadBalancer.Enabled = true
 	cfg.LoadBalancer.InternalLB = false
+	cfg.LoadBalancer.NodeSelector = ""
 	cfg.LoadBalancer.LBProvider = "amphora"
 	cfg.LoadBalancer.LBMethod = "ROUND_ROBIN"
 	cfg.LoadBalancer.CreateMonitor = false
@@ -210,9 +219,14 @@ func ReadConfig(config io.Reader) (Config, error) {
 	cfg.LoadBalancer.MonitorDelay = util.MyDuration{Duration: 5 * time.Second}
 	cfg.LoadBalancer.MonitorTimeout = util.MyDuration{Duration: 3 * time.Second}
 	cfg.LoadBalancer.MonitorMaxRetries = 1
+	cfg.LoadBalancer.MonitorMaxRetriesDown = 3
 	cfg.LoadBalancer.CascadeDelete = true
 	cfg.LoadBalancer.EnableIngressHostname = false
+	cfg.LoadBalancer.IngressHostnameSuffix = defaultProxyHostnameSuffix
 	cfg.LoadBalancer.TlsContainerRef = ""
+	cfg.LoadBalancer.ContainerStore = "barbican"
+	cfg.LoadBalancer.MaxSharedLB = 2
+	cfg.LoadBalancer.ProviderRequiresSerialAPICalls = false
 
 	err := gcfg.FatalOnly(gcfg.ReadInto(&cfg, config))
 	if err != nil {
@@ -238,8 +252,12 @@ func ReadConfig(config io.Reader) (Config, error) {
 		cfg.Metadata.SearchOrder = fmt.Sprintf("%s,%s", metadata.ConfigDriveID, metadata.MetadataID)
 	}
 
-	if !util.Contains(supportedLBProvider, cfg.LoadBalancer.LBProvider) {
+	if !slices.Contains(supportedLBProvider, cfg.LoadBalancer.LBProvider) {
 		klog.Warningf("Unsupported LoadBalancer Provider: %s", cfg.LoadBalancer.LBProvider)
+	}
+
+	if !slices.Contains(supportedContainerStore, cfg.LoadBalancer.ContainerStore) {
+		klog.Warningf("Unsupported Container Store: %s", cfg.LoadBalancer.ContainerStore)
 	}
 
 	return cfg, err
@@ -255,29 +273,6 @@ func (c *caller) call(f func()) {
 	if *c {
 		f()
 	}
-}
-
-func readInstanceID(searchOrder string) (string, error) {
-	// First, try to get data from metadata service because local
-	// data might be changed by accident
-	md, err := metadata.Get(searchOrder)
-	if err == nil {
-		return md.UUID, nil
-	}
-
-	// Try to find instance ID on the local filesystem (created by cloud-init)
-	const instanceIDFile = "/var/lib/cloud/data/instance-id"
-	idBytes, err := ioutil.ReadFile(instanceIDFile)
-	if err == nil {
-		instanceID := string(idBytes)
-		instanceID = strings.TrimSpace(instanceID)
-		klog.V(3).Infof("Got instance id from %s: %s", instanceIDFile, instanceID)
-		if instanceID != "" && instanceID != "iid-datasource-none" {
-			return instanceID, nil
-		}
-	}
-
-	return "", err
 }
 
 // check opts for OpenStack
@@ -304,7 +299,6 @@ func NewOpenStack(cfg Config) (*OpenStack, error) {
 			Availability: cfg.Global.EndpointType,
 		},
 		lbOpts:         cfg.LoadBalancer,
-		bsOpts:         cfg.BlockStorage,
 		routeOpts:      cfg.Route,
 		metadataOpts:   cfg.Metadata,
 		networkingOpts: cfg.Networking,
@@ -322,269 +316,9 @@ func NewOpenStack(cfg Config) (*OpenStack, error) {
 	return &os, nil
 }
 
-// Initialize passes a Kubernetes clientBuilder interface to the cloud provider
-func (os *OpenStack) Initialize(clientBuilder cloudprovider.ControllerClientBuilder, stop <-chan struct{}) {
-}
-
-// mapNodeNameToServerName maps a k8s NodeName to an OpenStack Server Name
-// This is a simple string cast.
-func mapNodeNameToServerName(nodeName types.NodeName) string {
-	return string(nodeName)
-}
-
-// GetNodeNameByID maps instanceid to types.NodeName
-func (os *OpenStack) GetNodeNameByID(instanceID string) (types.NodeName, error) {
-	client, err := client.NewComputeV2(os.provider, os.epOpts)
-	var nodeName types.NodeName
-	if err != nil {
-		return nodeName, err
-	}
-
-	mc := metrics.NewMetricContext("server", "get")
-	server, err := servers.Get(client, instanceID).Extract()
-	if mc.ObserveRequest(err) != nil {
-		return nodeName, err
-	}
-	nodeName = mapServerToNodeName(server)
-	return nodeName, nil
-}
-
-// mapServerToNodeName maps an OpenStack Server to a k8s NodeName
-func mapServerToNodeName(server *servers.Server) types.NodeName {
-	// Node names are always lowercase, and (at least)
-	// routecontroller does case-sensitive string comparisons
-	// assuming this
-	return types.NodeName(strings.ToLower(server.Name))
-}
-
-func foreachServer(client *gophercloud.ServiceClient, opts servers.ListOptsBuilder, handler func(*servers.Server) (bool, error)) error {
-	mc := metrics.NewMetricContext("server", "list")
-	pager := servers.List(client, opts)
-
-	err := pager.EachPage(func(page pagination.Page) (bool, error) {
-		s, err := servers.ExtractServers(page)
-		if err != nil {
-			return false, err
-		}
-		for _, server := range s {
-			ok, err := handler(&server)
-			if !ok || err != nil {
-				return false, err
-			}
-		}
-		return true, nil
-	})
-	return mc.ObserveRequest(err)
-}
-
-func getServerByName(client *gophercloud.ServiceClient, name types.NodeName) (*ServerAttributesExt, error) {
-	opts := servers.ListOpts{
-		Name: fmt.Sprintf("^%s$", regexp.QuoteMeta(mapNodeNameToServerName(name))),
-	}
-
-	var s []ServerAttributesExt
-	serverList := make([]ServerAttributesExt, 0, 1)
-
-	mc := metrics.NewMetricContext("server", "list")
-	pager := servers.List(client, opts)
-
-	err := pager.EachPage(func(page pagination.Page) (bool, error) {
-		if err := servers.ExtractServersInto(page, &s); err != nil {
-			return false, err
-		}
-		serverList = append(serverList, s...)
-		if len(serverList) > 1 {
-			return false, ErrMultipleResults
-		}
-		return true, nil
-	})
-	if mc.ObserveRequest(err) != nil {
-		return nil, err
-	}
-
-	if len(serverList) == 0 {
-		return nil, ErrNotFound
-	}
-
-	return &serverList[0], nil
-}
-
-// IP addresses order:
-// * interfaces private IPs
-// * access IPs
-// * metadata hostname
-// * server object Addresses (floating type)
-func nodeAddresses(srv *servers.Server, interfaces []attachinterfaces.Interface, networkingOpts NetworkingOpts) ([]v1.NodeAddress, error) {
-	addrs := []v1.NodeAddress{}
-
-	// parse private IP addresses first in an ordered manner
-	for _, iface := range interfaces {
-		for _, fixedIP := range iface.FixedIPs {
-			if iface.PortState == "ACTIVE" {
-				isIPv6 := net.ParseIP(fixedIP.IPAddress).To4() == nil
-				if !(isIPv6 && networkingOpts.IPv6SupportDisabled) {
-					AddToNodeAddresses(&addrs,
-						v1.NodeAddress{
-							Type:    v1.NodeInternalIP,
-							Address: fixedIP.IPAddress,
-						},
-					)
-				}
-			}
-		}
-	}
-
-	// process public IP addresses
-	if srv.AccessIPv4 != "" {
-		AddToNodeAddresses(&addrs,
-			v1.NodeAddress{
-				Type:    v1.NodeExternalIP,
-				Address: srv.AccessIPv4,
-			},
-		)
-	}
-
-	if srv.AccessIPv6 != "" && !networkingOpts.IPv6SupportDisabled {
-		AddToNodeAddresses(&addrs,
-			v1.NodeAddress{
-				Type:    v1.NodeExternalIP,
-				Address: srv.AccessIPv6,
-			},
-		)
-	}
-
-	if srv.Metadata[TypeHostName] != "" {
-		AddToNodeAddresses(&addrs,
-			v1.NodeAddress{
-				Type:    v1.NodeHostName,
-				Address: srv.Metadata[TypeHostName],
-			},
-		)
-	}
-
-	// process the rest
-	type Address struct {
-		IPType string `mapstructure:"OS-EXT-IPS:type"`
-		Addr   string
-	}
-
-	var addresses map[string][]Address
-	err := mapstructure.Decode(srv.Addresses, &addresses)
-	if err != nil {
-		return nil, err
-	}
-
-	var networks []string
-	for k := range addresses {
-		networks = append(networks, k)
-	}
-	sort.Strings(networks)
-
-	for _, network := range networks {
-		for _, props := range addresses[network] {
-			var addressType v1.NodeAddressType
-			if props.IPType == "floating" {
-				addressType = v1.NodeExternalIP
-			} else if util.Contains(networkingOpts.PublicNetworkName, network) {
-				addressType = v1.NodeExternalIP
-				// removing already added address to avoid listing it as both ExternalIP and InternalIP
-				// may happen due to listing "private" network as "public" in CCM's config
-				RemoveFromNodeAddresses(&addrs,
-					v1.NodeAddress{
-						Address: props.Addr,
-					},
-				)
-			} else {
-				if len(networkingOpts.InternalNetworkName) == 0 || util.Contains(networkingOpts.InternalNetworkName, network) {
-					addressType = v1.NodeInternalIP
-				} else {
-					klog.V(5).Infof("Node '%s' address '%s' ignored due to 'internal-network-name' option", srv.Name, props.Addr)
-					RemoveFromNodeAddresses(&addrs,
-						v1.NodeAddress{
-							Address: props.Addr,
-						},
-					)
-					continue
-				}
-			}
-
-			isIPv6 := net.ParseIP(props.Addr).To4() == nil
-			if !(isIPv6 && networkingOpts.IPv6SupportDisabled) {
-				AddToNodeAddresses(&addrs,
-					v1.NodeAddress{
-						Type:    addressType,
-						Address: props.Addr,
-					},
-				)
-			}
-		}
-	}
-
-	return addrs, nil
-}
-
-func getAddressesByName(client *gophercloud.ServiceClient, name types.NodeName, networkingOpts NetworkingOpts) ([]v1.NodeAddress, error) {
-	srv, err := getServerByName(client, name)
-	if err != nil {
-		return nil, err
-	}
-
-	interfaces, err := getAttachedInterfacesByID(client, srv.ID)
-	if err != nil {
-		return nil, err
-	}
-
-	return nodeAddresses(&srv.Server, interfaces, networkingOpts)
-}
-
-func getAddressByName(client *gophercloud.ServiceClient, name types.NodeName, needIPv6 bool, networkingOpts NetworkingOpts) (string, error) {
-	if needIPv6 && networkingOpts.IPv6SupportDisabled {
-		return "", ErrIPv6SupportDisabled
-	}
-
-	addrs, err := getAddressesByName(client, name, networkingOpts)
-	if err != nil {
-		return "", err
-	} else if len(addrs) == 0 {
-		return "", ErrNoAddressFound
-	}
-
-	for _, addr := range addrs {
-		isIPv6 := net.ParseIP(addr.Address).To4() == nil
-		if (addr.Type == v1.NodeInternalIP) && (isIPv6 == needIPv6) {
-			return addr.Address, nil
-		}
-	}
-
-	for _, addr := range addrs {
-		isIPv6 := net.ParseIP(addr.Address).To4() == nil
-		if (addr.Type == v1.NodeExternalIP) && (isIPv6 == needIPv6) {
-			return addr.Address, nil
-		}
-	}
-	// It should never return an address from a different IP Address family than the one needed
-	return "", ErrNoAddressFound
-}
-
-// getAttachedInterfacesByID returns the node interfaces of the specified instance.
-func getAttachedInterfacesByID(client *gophercloud.ServiceClient, serviceID string) ([]attachinterfaces.Interface, error) {
-	var interfaces []attachinterfaces.Interface
-
-	mc := metrics.NewMetricContext("server_os_interface", "list")
-	pager := attachinterfaces.List(client, serviceID)
-	err := pager.EachPage(func(page pagination.Page) (bool, error) {
-		s, err := attachinterfaces.ExtractInterfaces(page)
-		if err != nil {
-			return false, err
-		}
-		interfaces = append(interfaces, s...)
-		return true, nil
-	})
-	if mc.ObserveRequest(err) != nil {
-		return interfaces, err
-	}
-
-	return interfaces, nil
+// Instances v1 is no longer supported
+func (os *OpenStack) Instances() (cloudprovider.Instances, bool) {
+	return nil, false
 }
 
 // Clusters is a no-op
@@ -605,22 +339,20 @@ func (os *OpenStack) HasClusterID() bool {
 // LoadBalancer initializes a LbaasV2 object
 func (os *OpenStack) LoadBalancer() (cloudprovider.LoadBalancer, bool) {
 	klog.V(4).Info("openstack.LoadBalancer() called")
+	if !os.lbOpts.Enabled {
+		klog.V(4).Info("openstack.LoadBalancer() support for LoadBalancer controller is disabled")
+		return nil, false
+	}
 
 	network, err := client.NewNetworkV2(os.provider, os.epOpts)
 	if err != nil {
-		klog.Errorf("Failed to create an OpenStack Network client: %v", err)
+		klog.Fatalf("Failed to create an OpenStack Network client: %v", err)
 		return nil, false
 	}
 
-	compute, err := client.NewComputeV2(os.provider, os.epOpts)
+	lb, err := client.NewLoadBalancerV2(os.provider, os.epOpts)
 	if err != nil {
-		klog.Errorf("Failed to create an OpenStack Compute client: %v", err)
-		return nil, false
-	}
-
-	lb, err := client.NewLoadBalancerV2(os.provider, os.epOpts, os.lbOpts.UseOctavia)
-	if err != nil {
-		klog.Errorf("Failed to create an OpenStack LoadBalancer client: %v", err)
+		klog.Fatalf("Failed to create an OpenStack LoadBalancer client: %v", err)
 		return nil, false
 	}
 
@@ -634,123 +366,62 @@ func (os *OpenStack) LoadBalancer() (cloudprovider.LoadBalancer, bool) {
 	// Currently kubernetes OpenStack cloud provider just support LBaaS v2.
 	lbVersion := os.lbOpts.LBVersion
 	if lbVersion != "" && lbVersion != "v2" {
-		klog.Warningf("Config error: currently only support LBaaS v2, unrecognised lb-version \"%v\"", lbVersion)
+		klog.Fatalf("Config error: currently only support LBaaS v2, unrecognised lb-version \"%v\"", lbVersion)
 		return nil, false
 	}
 
 	klog.V(1).Info("Claiming to support LoadBalancer")
 
-	return &LbaasV2{LoadBalancer{secret, network, compute, lb, os.lbOpts}}, true
+	return &LbaasV2{LoadBalancer{secret, network, lb, os.lbOpts, os.kclient, os.eventRecorder}}, true
 }
 
 // Zones indicates that we support zones
+// DEPRECATED: Zones is deprecated in favor of retrieving zone/region information from InstancesV2.
 func (os *OpenStack) Zones() (cloudprovider.Zones, bool) {
-	klog.V(1).Info("Claiming to support Zones")
-	return os, true
-}
-
-// GetZone returns the current zone
-func (os *OpenStack) GetZone(ctx context.Context) (cloudprovider.Zone, error) {
-	md, err := metadata.Get(os.metadataOpts.SearchOrder)
-	if err != nil {
-		return cloudprovider.Zone{}, err
-	}
-
-	zone := cloudprovider.Zone{
-		FailureDomain: md.AvailabilityZone,
-		Region:        os.epOpts.Region,
-	}
-	klog.V(4).Infof("Current zone is %v", zone)
-	return zone, nil
-}
-
-// GetZoneByProviderID implements Zones.GetZoneByProviderID
-// This is particularly useful in external cloud providers where the kubelet
-// does not initialize node data.
-func (os *OpenStack) GetZoneByProviderID(ctx context.Context, providerID string) (cloudprovider.Zone, error) {
-	instanceID, err := instanceIDFromProviderID(providerID)
-	if err != nil {
-		return cloudprovider.Zone{}, err
-	}
-
-	compute, err := client.NewComputeV2(os.provider, os.epOpts)
-	if err != nil {
-		return cloudprovider.Zone{}, err
-	}
-
-	var serverWithAttributesExt ServerAttributesExt
-	mc := metrics.NewMetricContext("server", "get")
-	err = servers.Get(compute, instanceID).ExtractInto(&serverWithAttributesExt)
-	if mc.ObserveRequest(err) != nil {
-		return cloudprovider.Zone{}, err
-	}
-
-	zone := cloudprovider.Zone{
-		FailureDomain: serverWithAttributesExt.AvailabilityZone,
-		Region:        os.epOpts.Region,
-	}
-	klog.V(4).Infof("The instance %s in zone %v", serverWithAttributesExt.Name, zone)
-	return zone, nil
-}
-
-// GetZoneByNodeName implements Zones.GetZoneByNodeName
-// This is particularly useful in external cloud providers where the kubelet
-// does not initialize node data.
-func (os *OpenStack) GetZoneByNodeName(ctx context.Context, nodeName types.NodeName) (cloudprovider.Zone, error) {
-	compute, err := client.NewComputeV2(os.provider, os.epOpts)
-	if err != nil {
-		return cloudprovider.Zone{}, err
-	}
-
-	srv, err := getServerByName(compute, nodeName)
-	if err != nil {
-		if err == ErrNotFound {
-			return cloudprovider.Zone{}, cloudprovider.InstanceNotFound
-		}
-		return cloudprovider.Zone{}, err
-	}
-
-	zone := cloudprovider.Zone{
-		FailureDomain: srv.AvailabilityZone,
-		Region:        os.epOpts.Region,
-	}
-	klog.V(4).Infof("The instance %s in zone %v", srv.Name, zone)
-	return zone, nil
+	return nil, false
 }
 
 // Routes initializes routes support
 func (os *OpenStack) Routes() (cloudprovider.Routes, bool) {
 	klog.V(4).Info("openstack.Routes() called")
 
+	ctx := context.TODO()
 	network, err := client.NewNetworkV2(os.provider, os.epOpts)
 	if err != nil {
 		klog.Errorf("Failed to create an OpenStack Network client: %v", err)
 		return nil, false
 	}
 
-	netExts, err := networkExtensions(network)
+	netExts, err := openstackutil.GetNetworkExtensions(ctx, network)
 	if err != nil {
 		klog.Warningf("Failed to list neutron extensions: %v", err)
 		return nil, false
 	}
 
-	if !netExts["extraroute"] {
+	if !netExts["extraroute"] && !netExts["extraroute-atomic"] {
 		klog.V(3).Info("Neutron extraroute extension not found, required for Routes support")
 		return nil, false
 	}
 
-	compute, err := client.NewComputeV2(os.provider, os.epOpts)
-	if err != nil {
-		klog.Errorf("Failed to create an OpenStack Compute client: %v", err)
-		return nil, false
-	}
-
-	r, err := NewRoutes(compute, network, os.routeOpts, os.networkingOpts)
+	r, err := NewRoutes(os, network, netExts["extraroute-atomic"], netExts["allowed-address-pairs"])
 	if err != nil {
 		klog.Warningf("Error initialising Routes support: %v", err)
 		return nil, false
 	}
 
-	klog.V(1).Info("Claiming to support Routes")
+	if netExts["extraroute-atomic"] {
+		klog.V(1).Info("Claiming to support Routes with atomic updates")
+	} else {
+		klog.V(1).Info("Claiming to support Routes")
+	}
+
 	return r, true
+}
+
+// SetInformers implements InformerUser interface by setting up informer-fed caches to
+// leverage Kubernetes API for caching
+func (os *OpenStack) SetInformers(informerFactory informers.SharedInformerFactory) {
+	klog.V(1).Infof("Setting up informers for Cloud")
+	os.nodeInformer = informerFactory.Core().V1().Nodes()
+	os.nodeInformerHasSynced = os.nodeInformer.Informer().HasSynced
 }

@@ -21,7 +21,7 @@ import (
 	"strings"
 	"testing"
 
-	th "github.com/gophercloud/gophercloud/testhelper"
+	th "github.com/gophercloud/gophercloud/v2/testhelper"
 )
 
 func TestSyncConfigFromFile(t *testing.T) {
@@ -76,7 +76,7 @@ func TestSyncConfigValidation(t *testing.T) {
 	th.AssertEquals(
 		t,
 		fmt.Sprintf(
-			"Unsupported data type to sync: not_allowed_type. Available values: %v",
+			"unsupported data type to sync: not_allowed_type. Available values: %v",
 			strings.Join(allowedDataTypesToSync, ","),
 		),
 		err.Error(),

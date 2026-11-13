@@ -24,36 +24,36 @@ import (
 	"strings"
 	"time"
 
-	"github.com/gophercloud/gophercloud"
-	"github.com/gophercloud/gophercloud/openstack/blockstorage/v2/volumes"
-	"github.com/gophercloud/gophercloud/openstack/compute/v2/extensions/startstop"
-	"github.com/gophercloud/gophercloud/openstack/compute/v2/extensions/volumeattach"
-	"github.com/gophercloud/gophercloud/openstack/compute/v2/servers"
-	"github.com/gophercloud/gophercloud/openstack/containerinfra/v1/clusters"
-	"github.com/gophercloud/gophercloud/openstack/containerinfra/v1/nodegroups"
-	"github.com/gophercloud/gophercloud/openstack/orchestration/v1/stackresources"
-	"github.com/gophercloud/gophercloud/openstack/orchestration/v1/stacks"
-	"github.com/gophercloud/gophercloud/pagination"
-	uuid "github.com/pborman/uuid"
+	"github.com/gophercloud/gophercloud/v2"
+	gopenstack "github.com/gophercloud/gophercloud/v2/openstack"
+	"github.com/gophercloud/gophercloud/v2/openstack/blockstorage/v2/volumes"
+	"github.com/gophercloud/gophercloud/v2/openstack/compute/v2/servers"
+	"github.com/gophercloud/gophercloud/v2/openstack/compute/v2/volumeattach"
+	"github.com/gophercloud/gophercloud/v2/openstack/containerinfra/v1/clusters"
+	"github.com/gophercloud/gophercloud/v2/openstack/containerinfra/v1/nodegroups"
+	"github.com/gophercloud/gophercloud/v2/openstack/orchestration/v1/stackresources"
+	"github.com/gophercloud/gophercloud/v2/openstack/orchestration/v1/stacks"
+	"github.com/gophercloud/gophercloud/v2/pagination"
+	apiv1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/util/retry"
 	log "k8s.io/klog/v2"
 
+	"k8s.io/cloud-provider-openstack/pkg/autohealing/cloudprovider"
 	"k8s.io/cloud-provider-openstack/pkg/autohealing/config"
 	"k8s.io/cloud-provider-openstack/pkg/autohealing/healthcheck"
+	"k8s.io/cloud-provider-openstack/pkg/client"
+	"k8s.io/cloud-provider-openstack/pkg/util"
 )
 
 const (
-	ProviderName                  = "openstack"
-	ClusterAutoHealingLabel       = "auto_healing_enabled"
-	clusterStatusUpdateInProgress = "UPDATE_IN_PROGRESS"
-	clusterStatusUpdateComplete   = "UPDATE_COMPLETE"
-	clusterStatusUpdateFailed     = "UPDATE_FAILED"
-	stackStatusUpdateFailed       = "UPDATE_FAILED"
-	stackStatusUpdateInProgress   = "UPDATE_IN_PROGRESS"
-	stackStatusUpdateComplete     = "UPDATE_COMPLETE"
+	ProviderName                = "openstack"
+	ClusterAutoHealingLabel     = "auto_healing_enabled"
+	stackStatusUpdateFailed     = "UPDATE_FAILED"
+	stackStatusUpdateInProgress = "UPDATE_IN_PROGRESS"
 )
 
 var statusesPreventingRepair = sets.NewString(
@@ -66,8 +66,14 @@ var statusesPreventingRepair = sets.NewString(
 // the first time we found this unhealthy node, we will rebuild it.
 var unHealthyNodes = make(map[string]healthcheck.NodeInfo)
 
+// revive:disable:exported
+// Deprecated: use CloudProvider instead
+type OpenStackCloudProvider = CloudProvider
+
+// revive:enable:exported
+
 // OpenStack is an implementation of cloud provider Interface for OpenStack.
-type OpenStackCloudProvider struct {
+type CloudProvider struct {
 	KubeClient           kubernetes.Interface
 	Nova                 *gophercloud.ServiceClient
 	Heat                 *gophercloud.ServiceClient
@@ -84,13 +90,13 @@ type ResourceStackRelationship struct {
 	StackName    string
 }
 
-func (provider OpenStackCloudProvider) GetName() string {
+func (provider CloudProvider) GetName() string {
 	return ProviderName
 }
 
 // getStackName finds the name of a stack matching a given ID.
-func (provider *OpenStackCloudProvider) getStackName(stackID string) (string, error) {
-	stack, err := stacks.Find(provider.Heat, stackID).Extract()
+func (provider *CloudProvider) getStackName(ctx context.Context, stackID string) (string, error) {
+	stack, err := stacks.Find(ctx, provider.Heat, stackID).Extract()
 	if err != nil {
 		return "", err
 	}
@@ -102,14 +108,14 @@ func (provider *OpenStackCloudProvider) getStackName(stackID string) (string, er
 // masters and minions(workers). The key in the map is the server/instance ID
 // in Nova and the value is the resource ID and name of the server, and the
 // parent stack ID and name.
-func (provider *OpenStackCloudProvider) getAllStackResourceMapping(stackName, stackID string) (m map[string]ResourceStackRelationship, err error) {
+func (provider *CloudProvider) getAllStackResourceMapping(ctx context.Context, stackName, stackID string) (m map[string]ResourceStackRelationship, err error) {
 	if provider.ResourceStackMapping != nil {
 		return provider.ResourceStackMapping, nil
 	}
 
 	mapping := make(map[string]ResourceStackRelationship)
 
-	serverPages, err := stackresources.List(provider.Heat, stackName, stackID, stackresources.ListOpts{Depth: 2}).AllPages()
+	serverPages, err := stackresources.List(provider.Heat, stackName, stackID, stackresources.ListOpts{Depth: 2}).AllPages(ctx)
 	if err != nil {
 		return m, err
 	}
@@ -148,15 +154,16 @@ func (provider *OpenStackCloudProvider) getAllStackResourceMapping(stackName, st
 	return provider.ResourceStackMapping, nil
 }
 
-func (provider OpenStackCloudProvider) waitForServerPoweredOff(serverID string, timeout time.Duration) error {
-	err := startstop.Stop(provider.Nova, serverID).ExtractErr()
+func (provider CloudProvider) waitForServerPoweredOff(serverID string, timeout time.Duration) error {
+	ctx := context.Background()
+	err := servers.Stop(ctx, provider.Nova, serverID).ExtractErr()
 	if err != nil {
 		return err
 	}
 
-	err = wait.Poll(3*time.Second, timeout,
-		func() (bool, error) {
-			server, err := servers.Get(provider.Nova, serverID).Extract()
+	err = wait.PollUntilContextTimeout(ctx, 3*time.Second, timeout, false,
+		func(ctx context.Context) (bool, error) {
+			server, err := servers.Get(ctx, provider.Nova, serverID).Extract()
 			if err != nil {
 				return false, err
 			}
@@ -173,12 +180,13 @@ func (provider OpenStackCloudProvider) waitForServerPoweredOff(serverID string, 
 
 // waitForClusterStatus checks periodically to see if the cluster has entered a given status.
 // Returns when the status is observed or the timeout is reached.
-func (provider OpenStackCloudProvider) waitForClusterComplete(clusterID string, timeout time.Duration) error {
+func (provider CloudProvider) waitForClusterComplete(clusterID string, timeout time.Duration) error {
 	log.V(2).Infof("Waiting for cluster %s in complete status", clusterID)
 
-	err := wait.Poll(3*time.Second, timeout,
-		func() (bool, error) {
-			cluster, err := clusters.Get(provider.Magnum, clusterID).Extract()
+	ctx := context.Background()
+	err := wait.PollUntilContextTimeout(ctx, 3*time.Second, timeout, false,
+		func(ctx context.Context) (bool, error) {
+			cluster, err := clusters.Get(ctx, provider.Magnum, clusterID).Extract()
 			if err != nil {
 				return false, err
 			}
@@ -194,31 +202,32 @@ func (provider OpenStackCloudProvider) waitForClusterComplete(clusterID string, 
 // waitForServerDetachVolumes will detach all the attached volumes from the given
 // server with the timeout. And if there is a root volume of the server, the root
 // volume ID will be returned.
-func (provider OpenStackCloudProvider) waitForServerDetachVolumes(serverID string, timeout time.Duration) (string, error) {
+func (provider CloudProvider) waitForServerDetachVolumes(serverID string, timeout time.Duration) (string, error) {
+	ctx := context.Background()
 	rootVolumeID := ""
-	err := volumeattach.List(provider.Nova, serverID).EachPage(func(page pagination.Page) (bool, error) {
+	err := volumeattach.List(provider.Nova, serverID).EachPage(ctx, func(ctx context.Context, page pagination.Page) (bool, error) {
 		attachments, err := volumeattach.ExtractVolumeAttachments(page)
 		if err != nil {
 			return false, err
 		}
 		for _, attachment := range attachments {
-			volume, err := volumes.Get(provider.Cinder, attachment.VolumeID).Extract()
+			volume, err := volumes.Get(ctx, provider.Cinder, attachment.VolumeID).Extract()
 			if err != nil {
-				return false, fmt.Errorf("failed to get volume %s, error: %s", attachment.VolumeID, err)
+				return false, fmt.Errorf("failed to get volume %s, error: %v", attachment.VolumeID, err)
 			}
 
 			bootable, err := strconv.ParseBool(volume.Bootable)
 			if err != nil {
-				log.Warningf("Unexpected value for bootable volume %s in volume %s, error %s", volume.Bootable, volume, err)
+				log.Warningf("Unexpected value for bootable volume %s in volume %v, error %v", volume.Bootable, *volume, err)
 			}
 
 			log.Infof("volume %s is bootable %t", attachment.VolumeID, bootable)
 
-			if bootable == false {
+			if !bootable {
 				log.Infof("detaching volume %s for instance %s", attachment.VolumeID, serverID)
-				err := volumeattach.Delete(provider.Nova, serverID, attachment.ID).ExtractErr()
+				err := volumeattach.Delete(ctx, provider.Nova, serverID, attachment.ID).ExtractErr()
 				if err != nil {
-					return false, fmt.Errorf("failed to detach volume %s from instance %s, error: %s", attachment.VolumeID, serverID, err)
+					return false, fmt.Errorf("failed to detach volume %s from instance %s, error: %v", attachment.VolumeID, serverID, err)
 				}
 			} else {
 				rootVolumeID = attachment.VolumeID
@@ -230,9 +239,9 @@ func (provider OpenStackCloudProvider) waitForServerDetachVolumes(serverID strin
 	if err != nil {
 		return rootVolumeID, err
 	}
-	err = wait.Poll(3*time.Second, timeout,
-		func() (bool, error) {
-			server, err := servers.Get(provider.Nova, serverID).Extract()
+	err = wait.PollUntilContextTimeout(ctx, 3*time.Second, timeout, false,
+		func(ctx context.Context) (bool, error) {
+			server, err := servers.Get(ctx, provider.Nova, serverID).Extract()
 			if err != nil {
 				return false, err
 			}
@@ -250,15 +259,99 @@ func (provider OpenStackCloudProvider) waitForServerDetachVolumes(serverID strin
 	return rootVolumeID, err
 }
 
+// FirstTimeRepair Handle the first time repair for a node
+//  1. If the node is the first time in error, reboot and uncordon it
+//  2. If the node is not the first time in error, check if the last reboot time is in provider.Config.RebuildDelayAfterReboot
+//     That said, if the node has been found in broken status before but has been long time since then, the processed variable
+//     will be kept as False, which means the node need to be rebuilt to fix it, otherwise it means the has been processed.
+//
+// The bool type return value means that if the node has been processed from a first time repair PoV
+func (provider CloudProvider) firstTimeRepair(ctx context.Context, n healthcheck.NodeInfo, serverID string, firstTimeRebootNodes map[string]healthcheck.NodeInfo) (bool, error) {
+	var firstTimeUnhealthy = true
+	for id := range unHealthyNodes {
+		log.V(5).Infof("comparing server ID %s with known broken ID %s", serverID, id)
+		if id == serverID {
+			log.Infof("it is NOT the first time that node %s is being repaired", serverID)
+			firstTimeUnhealthy = false
+			break
+		}
+	}
+
+	var processed = false
+	if firstTimeUnhealthy {
+		log.Infof("rebooting node %s to repair it", serverID)
+
+		if res := servers.Reboot(ctx, provider.Nova, serverID, servers.RebootOpts{Type: servers.SoftReboot}); res.Err != nil {
+			// Usually it means the node is being rebooted
+			log.Warningf("failed to reboot node %s, error: %v", serverID, res.Err)
+			if strings.Contains(res.Err.Error(), "reboot_started") {
+				// The node has been restarted
+				firstTimeRebootNodes[serverID] = n
+			}
+		} else {
+			// Uncordon the node
+			if n.IsWorker {
+				nodeName := n.KubeNode.Name
+				// timeout for wait.Poll
+				ctx := context.Background()
+				errServiceUp := wait.PollUntilContextTimeout(ctx, 3*time.Second, provider.Config.RebuildDelayAfterReboot, false,
+					func(ctx context.Context) (bool, error) {
+						repairedNode, getErr := provider.KubeClient.CoreV1().Nodes().Get(ctx, nodeName, metav1.GetOptions{})
+						if getErr != nil {
+							log.Errorf("Failed to get node %s, error: %v", nodeName, getErr)
+							return false, getErr
+						}
+						if CheckNodeCondition(repairedNode, apiv1.NodeReady, apiv1.ConditionTrue) {
+							retryErr := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+								// Retrieve the latest version of Node before attempting update
+								// RetryOnConflict uses exponential backoff to avoid exhausting the apiserver
+								repairedNode.Spec.Unschedulable = false
+								if _, updateErr := provider.KubeClient.CoreV1().Nodes().Update(ctx, repairedNode, metav1.UpdateOptions{}); updateErr != nil {
+									log.Warningf("Failed to uncordon node %s, error: %v", nodeName, updateErr)
+									return updateErr
+								} else {
+									log.Infof("Node %s is uncordoned", nodeName)
+									return nil
+								}
+							})
+							return true, retryErr
+						}
+						return false, nil
+					})
+				if errServiceUp != nil {
+					log.Infof("Reboot doesn't repair Node %s error: %v", nodeName, errServiceUp)
+				}
+			}
+			n.RebootAt = time.Now()
+			firstTimeRebootNodes[serverID] = n
+			unHealthyNodes[serverID] = n
+			log.Infof("Node %s has been rebooted at %s", serverID, n.RebootAt)
+		}
+		processed = true
+	} else {
+		// If the node was rebooted within mins (defined by RepairDelayAfterReboot), ignore it
+		log.Infof("Node %s is found in unhealthy again which was rebooted at %s", serverID, unHealthyNodes[serverID].RebootAt)
+		if unHealthyNodes[serverID].RebootAt.After(time.Now().Add(-1 * provider.Config.RebuildDelayAfterReboot)) {
+			log.Infof("Node %s is found in unhealthy again, but we're going to defer the repair because it maybe in reboot process", serverID)
+			firstTimeRebootNodes[serverID] = n
+			processed = true
+		}
+	}
+
+	return processed, nil
+}
+
 // Repair  For master nodes: detach etcd and docker volumes, find the root
-//         volume, then shutdown the VM, marks the both the VM and the root
-//         volume (heat resource) as "unhealthy" then trigger Heat stack update
-//         in order to rebuild the node. The information this function needs:
-//         - Nova VM ID
-//         - Root volume ID
-// 	       - Heat stack ID and resource ID.
+//
+//	        volume, then shutdown the VM, marks the both the VM and the root
+//	        volume (heat resource) as "unhealthy" then trigger Heat stack update
+//	        in order to rebuild the node. The information this function needs:
+//	        - Nova VM ID
+//	        - Root volume ID
+//		       - Heat stack ID and resource ID.
+//
 // For worker nodes: Call Magnum resize API directly.
-func (provider OpenStackCloudProvider) Repair(nodes []healthcheck.NodeInfo) error {
+func (provider CloudProvider) Repair(ctx context.Context, nodes []healthcheck.NodeInfo) error {
 	if len(nodes) == 0 {
 		return nil
 	}
@@ -275,12 +368,14 @@ func (provider OpenStackCloudProvider) Repair(nodes []healthcheck.NodeInfo) erro
 		masters = nodes
 	}
 
-	err := provider.UpdateHealthStatus(masters, workers)
+	firstTimeRebootNodes := make(map[string]healthcheck.NodeInfo)
+
+	err := provider.UpdateHealthStatus(ctx, masters, workers)
 	if err != nil {
-		return fmt.Errorf("failed to update the helath status of cluster %s, error: %v", clusterName, err)
+		return fmt.Errorf("failed to update the health status of cluster %s, error: %v", clusterName, err)
 	}
 
-	cluster, err := clusters.Get(provider.Magnum, clusterName).Extract()
+	cluster, err := clusters.Get(ctx, provider.Magnum, clusterName).Extract()
 	if err != nil {
 		return fmt.Errorf("failed to get the cluster %s, error: %v", clusterName, err)
 	}
@@ -288,28 +383,16 @@ func (provider OpenStackCloudProvider) Repair(nodes []healthcheck.NodeInfo) erro
 	if isWorkerNode {
 		for _, n := range nodes {
 			nodesToReplace := sets.NewString()
-			machineID := uuid.Parse(n.KubeNode.Status.NodeInfo.MachineID)
-			if machineID == nil {
-				log.Warningf("Failed to get the correct server ID for server %s", n.KubeNode.Name)
+			serverID, err := util.UUID(n.KubeNode.Status.NodeInfo.MachineID)
+			if err != nil {
+				log.Warningf("Failed to get the correct server ID for server %s: %v", n.KubeNode.Name, err)
 				continue
 			}
-			serverID := machineID.String()
 
-			var firsttimeUnhealthy = true
-			for id := range unHealthyNodes {
-				log.V(5).Infof("comparing server ID %s with known broken ID %s", serverID, id)
-				if id == serverID {
-					firsttimeUnhealthy = false
-					break
-				}
-			}
-
-			if firsttimeUnhealthy == true {
-				unHealthyNodes[serverID] = n
-				log.Infof("rebooting node %s to repair it", serverID)
-				if res := servers.Reboot(provider.Nova, serverID, servers.RebootOpts{Type: servers.SoftReboot}); res.Err != nil {
-					log.Warningf("failed to reboot node %s, error: %v", serverID, res.Err)
-				}
+			if processed, err := provider.firstTimeRepair(ctx, n, serverID, firstTimeRebootNodes); err != nil {
+				log.Warningf("Failed to process if the node %s is in first time repair , error: %v", serverID, err)
+			} else if processed {
+				log.Infof("Node %s has been processed", serverID)
 				continue
 			}
 
@@ -322,7 +405,7 @@ func (provider OpenStackCloudProvider) Repair(nodes []healthcheck.NodeInfo) erro
 			}
 
 			nodesToReplace.Insert(serverID)
-			ng, err := provider.getNodeGroup(clusterName, n)
+			ng, err := provider.getNodeGroup(ctx, clusterName, n)
 			ngName := "default-worker"
 			ngNodeCount := &cluster.NodeCount
 			if err == nil {
@@ -336,7 +419,7 @@ func (provider OpenStackCloudProvider) Repair(nodes []healthcheck.NodeInfo) erro
 				NodesToRemove: nodesToReplace.List(),
 			}
 
-			clusters.Resize(provider.Magnum, clusterName, opts)
+			clusters.Resize(ctx, provider.Magnum, clusterName, opts)
 			// Wait 10 seconds to make sure Magnum has already got the request
 			// to avoid sending all of the resize API calls at the same time.
 			time.Sleep(10 * time.Second)
@@ -349,14 +432,14 @@ func (provider OpenStackCloudProvider) Repair(nodes []healthcheck.NodeInfo) erro
 			log.Infof("Cluster %s resized", clusterName)
 		}
 	} else {
-		clusterStackName, err := provider.getStackName(cluster.StackID)
+		clusterStackName, err := provider.getStackName(ctx, cluster.StackID)
 		if err != nil {
 			return fmt.Errorf("failed to get the Heat stack for cluster %s, error: %v", clusterName, err)
 		}
 
 		// In order to rebuild the nodes by Heat stack update, we need to know the parent stack ID of the resources and
 		// mark them unhealthy first.
-		allMapping, err := provider.getAllStackResourceMapping(clusterStackName, cluster.StackID)
+		allMapping, err := provider.getAllStackResourceMapping(ctx, clusterStackName, cluster.StackID)
 		if err != nil {
 			return fmt.Errorf("failed to get the resource stack mapping for cluster %s, error: %v", clusterName, err)
 		}
@@ -367,28 +450,16 @@ func (provider OpenStackCloudProvider) Repair(nodes []healthcheck.NodeInfo) erro
 		}
 
 		for _, n := range nodes {
-			machineID := uuid.Parse(n.KubeNode.Status.NodeInfo.MachineID)
-			if machineID == nil {
-				log.Warningf("Failed to get the correct server ID for server %s", n.KubeNode.Name)
+			serverID, err := util.UUID(n.KubeNode.Status.NodeInfo.MachineID)
+			if err != nil {
+				log.Warningf("Failed to get the correct server ID for server %s: %v", n.KubeNode.Name, err)
 				continue
 			}
-			serverID := machineID.String()
 
-			var firsttimeUnhealthy = true
-			for id := range unHealthyNodes {
-				log.Infof("comparing server ID %s with known broken ID %s", serverID, id)
-				if id == serverID {
-					firsttimeUnhealthy = false
-					break
-				}
-			}
-
-			if firsttimeUnhealthy == true {
-				unHealthyNodes[serverID] = n
-				log.Infof("rebooting node %s to repair it", serverID)
-				if res := servers.Reboot(provider.Nova, serverID, servers.RebootOpts{Type: servers.SoftReboot}); res.Err != nil {
-					log.Warningf("failed to reboot node %s, error: %v", serverID, res.Err)
-				}
+			if processed, err := provider.firstTimeRepair(ctx, n, serverID, firstTimeRebootNodes); err != nil {
+				log.Warningf("Failed to process if the node %s is in first time repair , error: %v", serverID, err)
+			} else if processed {
+				log.Infof("Node %s has been processed", serverID)
 				continue
 			}
 
@@ -397,21 +468,27 @@ func (provider OpenStackCloudProvider) Repair(nodes []healthcheck.NodeInfo) erro
 			} else {
 				// Mark root volume as unhealthy
 				if rootVolumeID != "" {
-					err = stackresources.MarkUnhealthy(provider.Heat, allMapping[serverID].StackName, allMapping[serverID].StackID, rootVolumeID, opts).ExtractErr()
+					err = stackresources.MarkUnhealthy(ctx, provider.Heat, allMapping[serverID].StackName, allMapping[serverID].StackID, rootVolumeID, opts).ExtractErr()
 					if err != nil {
 						log.Errorf("failed to mark resource %s unhealthy, error: %v", rootVolumeID, err)
 					}
 				}
 			}
 
-			if err := provider.waitForServerPoweredOff(serverID, 30*time.Second); err != nil {
+			if err := provider.waitForServerPoweredOff(serverID, 180*time.Second); err != nil {
 				log.Warningf("Failed to shutdown the server %s, error: %v", serverID, err)
+				// If the server is failed to delete after 180s, then delete it to avoid the
+				// stack update failure later.
+				res := servers.ForceDelete(ctx, provider.Nova, serverID)
+				if res.Err != nil {
+					log.Warningf("Failed to delete the server %s, error: %v", serverID, err)
+				}
 			}
 
 			log.Infof("Marking Nova VM %s(Heat resource %s) unhealthy for Heat stack %s", serverID, allMapping[serverID].ResourceID, cluster.StackID)
 
 			// Mark VM as unhealthy
-			err = stackresources.MarkUnhealthy(provider.Heat, allMapping[serverID].StackName, allMapping[serverID].StackID, allMapping[serverID].ResourceID, opts).ExtractErr()
+			err = stackresources.MarkUnhealthy(ctx, provider.Heat, allMapping[serverID].StackName, allMapping[serverID].StackID, allMapping[serverID].ResourceID, opts).ExtractErr()
 			if err != nil {
 				log.Errorf("failed to mark resource %s unhealthy, error: %v", serverID, err)
 			}
@@ -419,7 +496,7 @@ func (provider OpenStackCloudProvider) Repair(nodes []healthcheck.NodeInfo) erro
 			delete(unHealthyNodes, serverID)
 		}
 
-		if err := stacks.UpdatePatch(provider.Heat, clusterStackName, cluster.StackID, stacks.UpdateOpts{}).ExtractErr(); err != nil {
+		if err := stacks.UpdatePatch(ctx, provider.Heat, clusterStackName, cluster.StackID, stacks.UpdateOpts{}).ExtractErr(); err != nil {
 			return fmt.Errorf("failed to update Heat stack to rebuild resources, error: %v", err)
 		}
 
@@ -428,7 +505,16 @@ func (provider OpenStackCloudProvider) Repair(nodes []healthcheck.NodeInfo) erro
 
 	// Remove the broken nodes from the cluster
 	for _, n := range nodes {
-		if err := provider.KubeClient.CoreV1().Nodes().Delete(context.TODO(), n.KubeNode.Name, metav1.DeleteOptions{}); err != nil {
+		serverID, err := util.UUID(n.KubeNode.Status.NodeInfo.MachineID)
+		if err != nil {
+			log.Warningf("Failed to get the correct server ID for server %s: %v", n.KubeNode.Name, err)
+			continue
+		}
+		if _, found := firstTimeRebootNodes[serverID]; found {
+			log.Infof("Skip node delete for %s because it's repaired by reboot", serverID)
+			continue
+		}
+		if err := provider.KubeClient.CoreV1().Nodes().Delete(ctx, n.KubeNode.Name, metav1.DeleteOptions{}); err != nil {
 			log.Errorf("Failed to remove the node %s from cluster, error: %v", n.KubeNode.Name, err)
 		}
 	}
@@ -436,10 +522,10 @@ func (provider OpenStackCloudProvider) Repair(nodes []healthcheck.NodeInfo) erro
 	return nil
 }
 
-func (provider OpenStackCloudProvider) getNodeGroup(clusterName string, node healthcheck.NodeInfo) (nodegroups.NodeGroup, error) {
+func (provider CloudProvider) getNodeGroup(ctx context.Context, clusterName string, node healthcheck.NodeInfo) (nodegroups.NodeGroup, error) {
 	var ng nodegroups.NodeGroup
 
-	ngPages, err := nodegroups.List(provider.Magnum, clusterName, nodegroups.ListOpts{}).AllPages()
+	ngPages, err := nodegroups.List(provider.Magnum, clusterName, nodegroups.ListOpts{}).AllPages(ctx)
 	if err == nil {
 		ngs, err := nodegroups.ExtractNodeGroups(ngPages)
 		if err != nil {
@@ -447,7 +533,7 @@ func (provider OpenStackCloudProvider) getNodeGroup(clusterName string, node hea
 			return ng, err
 		}
 		for _, ng := range ngs {
-			ngInfo, err := nodegroups.Get(provider.Magnum, clusterName, ng.UUID).Extract()
+			ngInfo, err := nodegroups.Get(ctx, provider.Magnum, clusterName, ng.UUID).Extract()
 			if err != nil {
 				log.Warningf("Failed to get node group for cluster %s, error: %v", clusterName, err)
 				return ng, err
@@ -469,7 +555,7 @@ func (provider OpenStackCloudProvider) getNodeGroup(clusterName string, node hea
 
 // UpdateHealthStatus can update the cluster health status to reflect the
 // real-time health status of the k8s cluster.
-func (provider OpenStackCloudProvider) UpdateHealthStatus(masters []healthcheck.NodeInfo, workers []healthcheck.NodeInfo) error {
+func (provider CloudProvider) UpdateHealthStatus(ctx context.Context, masters []healthcheck.NodeInfo, workers []healthcheck.NodeInfo) error {
 	log.Infof("start to update cluster health status.")
 	clusterName := provider.Config.ClusterName
 
@@ -498,7 +584,7 @@ func (provider OpenStackCloudProvider) UpdateHealthStatus(masters []healthcheck.
 	if err != nil {
 		return fmt.Errorf("failed to build health status reason for cluster %s, error: %v", clusterName, err)
 	}
-	healthStatusReason := strings.Replace(string(jsonDumps), "\"", "'", -1)
+	healthStatusReason := strings.ReplaceAll(string(jsonDumps), "\"", "'")
 
 	updateOpts := []clusters.UpdateOptsBuilder{
 		clusters.UpdateOpts{
@@ -514,7 +600,7 @@ func (provider OpenStackCloudProvider) UpdateHealthStatus(masters []healthcheck.
 	}
 
 	log.Infof("updating cluster health status as %s for reason %s.", healthStatus, healthStatusReason)
-	res := clusters.Update(provider.Magnum, clusterName, updateOpts)
+	res := clusters.Update(ctx, provider.Magnum, clusterName, updateOpts)
 
 	if res.Err != nil {
 		return fmt.Errorf("failed to update the health status of cluster %s error: %v", clusterName, res.Err)
@@ -531,10 +617,10 @@ func (provider OpenStackCloudProvider) UpdateHealthStatus(masters []healthcheck.
 // There are  two conditions that we disable the repair:
 // - The cluster admin disables the auto healing via OpenStack API.
 // - The Magnum cluster is not in stable status.
-func (provider OpenStackCloudProvider) Enabled() bool {
+func (provider CloudProvider) Enabled(ctx context.Context) bool {
 	clusterName := provider.Config.ClusterName
 
-	cluster, err := clusters.Get(provider.Magnum, clusterName).Extract()
+	cluster, err := clusters.Get(ctx, provider.Magnum, clusterName).Extract()
 	if err != nil {
 		log.Warningf("failed to get the cluster %s, error: %v", clusterName, err)
 		return false
@@ -545,7 +631,7 @@ func (provider OpenStackCloudProvider) Enabled() bool {
 	}
 
 	if _, isPresent := cluster.Labels[ClusterAutoHealingLabel]; !isPresent {
-		log.Infof("Autohealing is disalbed for cluster %s", clusterName)
+		log.Infof("Autohealing is disabled for cluster %s", clusterName)
 		return false
 	}
 	autoHealingEnabled, err := strconv.ParseBool(cluster.Labels[ClusterAutoHealingLabel])
@@ -554,16 +640,16 @@ func (provider OpenStackCloudProvider) Enabled() bool {
 		return false
 	}
 	if !autoHealingEnabled {
-		log.Infof("Autohealing is disalbed for cluster %s", clusterName)
+		log.Infof("Autohealing is disabled for cluster %s", clusterName)
 		return false
 	}
 
-	clusterStackName, err := provider.getStackName(cluster.StackID)
+	clusterStackName, err := provider.getStackName(ctx, cluster.StackID)
 	if err != nil {
 		log.Warningf("Failed to get the Heat stack ID for cluster %s, error: %v", clusterName, err)
 		return false
 	}
-	stack, err := stacks.Get(provider.Heat, clusterStackName, cluster.StackID).Extract()
+	stack, err := stacks.Get(ctx, provider.Heat, clusterStackName, cluster.StackID).Extract()
 	if err != nil {
 		log.Warningf("Failed to get Heat stack %s for cluster %s, error: %v", cluster.StackID, clusterName, err)
 		return false
@@ -575,4 +661,69 @@ func (provider OpenStackCloudProvider) Enabled() bool {
 	}
 
 	return true
+}
+
+// CheckNodeCondition check if a node's condition list contains the given condition type and status
+func CheckNodeCondition(node *apiv1.Node, conditionType apiv1.NodeConditionType, conditionStatus apiv1.ConditionStatus) bool {
+	if len(node.Status.Conditions) == 0 {
+		return false
+	}
+	for _, cond := range node.Status.Conditions {
+		if cond.Type == conditionType && cond.Status == conditionStatus {
+			return true
+		}
+	}
+	return false
+}
+
+func NewOpenStackCloudProvider(cfg config.Config, kubeClient kubernetes.Interface) (cloudprovider.CloudProvider, error) {
+	client, err := client.NewOpenStackClient(&cfg.OpenStack, "magnum-auto-healer")
+	if err != nil {
+		return nil, err
+	}
+
+	eoOpts := gophercloud.EndpointOpts{
+		Region:       cfg.OpenStack.Region,
+		Availability: cfg.OpenStack.EndpointType,
+	}
+
+	// get nova service client
+	var novaClient *gophercloud.ServiceClient
+	novaClient, err = gopenstack.NewComputeV2(client, eoOpts)
+	if err != nil {
+		return nil, fmt.Errorf("failed to find Nova service endpoint in the region %s: %v", cfg.OpenStack.Region, err)
+	}
+
+	// get heat service client
+	var heatClient *gophercloud.ServiceClient
+	heatClient, err = gopenstack.NewOrchestrationV1(client, eoOpts)
+	if err != nil {
+		return nil, fmt.Errorf("failed to find Heat service endpoint in the region %s: %v", cfg.OpenStack.Region, err)
+	}
+
+	// get magnum service client
+	var magnumClient *gophercloud.ServiceClient
+	magnumClient, err = gopenstack.NewContainerInfraV1(client, eoOpts)
+	if err != nil {
+		return nil, fmt.Errorf("failed to find Magnum service endpoint in the region %s: %v", cfg.OpenStack.Region, err)
+	}
+	magnumClient.Microversion = "latest"
+
+	// get cinder service client
+	var cinderClient *gophercloud.ServiceClient
+	cinderClient, err = gopenstack.NewBlockStorageV3(client, eoOpts)
+	if err != nil {
+		return nil, fmt.Errorf("failed to find Cinder service endpoint in the region %s: %v", cfg.OpenStack.Region, err)
+	}
+
+	p := CloudProvider{
+		KubeClient: kubeClient,
+		Nova:       novaClient,
+		Heat:       heatClient,
+		Magnum:     magnumClient,
+		Cinder:     cinderClient,
+		Config:     cfg,
+	}
+
+	return p, nil
 }

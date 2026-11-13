@@ -2,29 +2,18 @@
 # external-attacher, external-provisioner, external-snapshotter
 # external-resize, liveness-probe
 
-kind: Service
-apiVersion: v1
-metadata:
-  name: csi-cinder-controller-service
-  namespace: kube-system
-  labels:
-    app: csi-cinder-controllerplugin
-spec:
-  selector:
-    app: csi-cinder-controllerplugin
-  ports:
-    - name: dummy
-      port: 12345
-
----
-kind: StatefulSet
+kind: Deployment
 apiVersion: apps/v1
 metadata:
   name: csi-cinder-controllerplugin
   namespace: kube-system
 spec:
-  serviceName: "csi-cinder-controller-service"
   replicas: 1
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
   selector:
     matchLabels:
       app: csi-cinder-controllerplugin
@@ -36,10 +25,19 @@ spec:
       serviceAccount: csi-cinder-controller-sa
       containers:
         - name: csi-attacher
-          image: k8s.gcr.io/sig-storage/csi-attacher:v3.1.0
+          securityContext:
+            # Images use distroless/static:latest which runs as root; runAsNonRoot
+            # and allowPrivilegeEscalation cannot be set until upstream switches to
+            # a nonroot base image.
+            readOnlyRootFilesystem: true
+            seccompProfile:
+              type: RuntimeDefault
+          image: registry.k8s.io/sig-storage/csi-attacher:v4.10.0
           args:
             - "--csi-address=$(ADDRESS)"
             - "--timeout=3m"
+            - "--leader-election=true"
+            - "--default-fstype=ext4"
           env:
             - name: ADDRESS
               value: /var/lib/csi/sockets/pluginproxy/csi.sock
@@ -48,12 +46,18 @@ spec:
             - name: socket-dir
               mountPath: /var/lib/csi/sockets/pluginproxy/
         - name: csi-provisioner
-          image: k8s.gcr.io/sig-storage/csi-provisioner:v2.1.1
+          securityContext:
+            readOnlyRootFilesystem: true
+            seccompProfile:
+              type: RuntimeDefault
+          image: registry.k8s.io/sig-storage/csi-provisioner:v5.3.0
           args:
             - "--csi-address=$(ADDRESS)"
             - "--timeout=3m"
             - "--default-fstype=ext4"
             - "--feature-gates=Topology=true"
+            - "--extra-create-metadata"
+            - "--leader-election=true"
           env:
             - name: ADDRESS
               value: /var/lib/csi/sockets/pluginproxy/csi.sock
@@ -62,10 +66,16 @@ spec:
             - name: socket-dir
               mountPath: /var/lib/csi/sockets/pluginproxy/
         - name: csi-snapshotter
-          image: k8s.gcr.io/sig-storage/csi-snapshotter:v2.1.3
+          securityContext:
+            readOnlyRootFilesystem: true
+            seccompProfile:
+              type: RuntimeDefault
+          image: registry.k8s.io/sig-storage/csi-snapshotter:v8.4.0
           args:
             - "--csi-address=$(ADDRESS)"
             - "--timeout=3m"
+            - "--extra-create-metadata"
+            - "--leader-election=true"
           env:
             - name: ADDRESS
               value: /var/lib/csi/sockets/pluginproxy/csi.sock
@@ -74,11 +84,16 @@ spec:
             - mountPath: /var/lib/csi/sockets/pluginproxy/
               name: socket-dir
         - name: csi-resizer
-          image: k8s.gcr.io/sig-storage/csi-resizer:v1.1.0
+          securityContext:
+            readOnlyRootFilesystem: true
+            seccompProfile:
+              type: RuntimeDefault
+          image: registry.k8s.io/sig-storage/csi-resizer:v1.14.0
           args:
             - "--csi-address=$(ADDRESS)"
             - "--timeout=3m"
             - "--handle-volume-inuse-error=false"
+            - "--leader-election=true"
           env:
             - name: ADDRESS
               value: /var/lib/csi/sockets/pluginproxy/csi.sock
@@ -87,7 +102,11 @@ spec:
             - name: socket-dir
               mountPath: /var/lib/csi/sockets/pluginproxy/
         - name: liveness-probe
-          image: k8s.gcr.io/sig-storage/livenessprobe:v2.1.0
+          securityContext:
+            readOnlyRootFilesystem: true
+            seccompProfile:
+              type: RuntimeDefault
+          image: registry.k8s.io/sig-storage/livenessprobe:v2.17.0
           args:
             - "--csi-address=$(ADDRESS)"
           env:
@@ -97,18 +116,19 @@ spec:
             - mountPath: /var/lib/csi/sockets/pluginproxy/
               name: socket-dir
         - name: cinder-csi-plugin
-          image: docker.io/k8scloudprovider/cinder-csi-plugin:latest
+          securityContext:
+            readOnlyRootFilesystem: true
+            seccompProfile:
+              type: RuntimeDefault
+          image: registry.k8s.io/provider-os/cinder-csi-plugin:v1.38.0
           args:
             - /bin/cinder-csi-plugin
-            - "--nodeid=$(NODE_ID)"
             - "--endpoint=$(CSI_ENDPOINT)"
             - "--cloud-config=$(CLOUD_CONFIG)"
             - "--cluster=$(CLUSTER_NAME)"
+            - "--pvc-annotations"
+            - "--v=1"
           env:
-            - name: NODE_ID
-              valueFrom:
-                fieldRef:
-                  fieldPath: spec.nodeName
             - name: CSI_ENDPOINT
               value: unix://csi/csi.sock
             - name: CLOUD_CONFIG
@@ -135,9 +155,16 @@ spec:
             - name: secret-cinderplugin
               mountPath: /etc/config
               readOnly: true
+            # - name: cacert
+            #   mountPath: /etc/cacert
+            #   readOnly: true
+      priorityClassName: system-cluster-critical
       volumes:
         - name: socket-dir
           emptyDir:
         - name: secret-cinderplugin
           secret:
             secretName: cloud-config
+        # - name: cacert
+        #   hostPath:
+        #     path: /etc/cacert

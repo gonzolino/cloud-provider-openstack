@@ -1,16 +1,36 @@
 package util
 
 import (
+	"context"
+	"encoding/json"
 	"fmt"
+	"regexp"
+	"strings"
 	"time"
+	"unicode"
 
-	"k8s.io/apimachinery/pkg/api/resource"
+	"github.com/google/uuid"
+	v1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/sets"
+	"k8s.io/apimachinery/pkg/util/strategicpatch"
+	clientset "k8s.io/client-go/kubernetes"
 )
 
-const (
-	GIB = 1024 * 1024 * 1024
-)
+// CutString255 makes sure the string length doesn't exceed 255, which is usually the maximum string length in OpenStack.
+func CutString255(original string) string {
+	ret := original
+	if len(original) > 255 {
+		ret = original[:255]
+	}
+	return ret
+}
+
+// Sprintf255 formats according to a format specifier and returns the resulting string with a maximum length of 255 characters.
+func Sprintf255(format string, args ...interface{}) string {
+	return CutString255(fmt.Sprintf(format, args...))
+}
 
 // MyDuration is the encoding.TextUnmarshaler interface for time.Duration
 type MyDuration struct {
@@ -37,11 +57,11 @@ func StringListEqual(list1, list2 []string) bool {
 		return false
 	}
 
-	s1 := sets.String{}
+	s1 := sets.New[string]()
 	for _, s := range list1 {
 		s1.Insert(s)
 	}
-	s2 := sets.String{}
+	s2 := sets.New[string]()
 	for _, s := range list2 {
 		s2.Insert(s)
 	}
@@ -49,14 +69,29 @@ func StringListEqual(list1, list2 []string) bool {
 	return s1.Equal(s2)
 }
 
-// Contains searches if a string list contains the given string or not.
-func Contains(list []string, strToSearch string) bool {
-	for _, item := range list {
-		if item == strToSearch {
-			return true
+// StringToMap converts a string of comma-separated key-values into a map
+func StringToMap(str string) map[string]string {
+	// break up a "key1=val,key2=val2,key3=,key4" string into a list
+	values := strings.Split(strings.TrimSpace(str), ",")
+	keyValues := make(map[string]string, len(values))
+
+	for _, kv := range values {
+		kv := strings.SplitN(strings.TrimSpace(kv), "=", 2)
+
+		k := kv[0]
+		if len(kv) == 1 {
+			if k != "" {
+				// process "key=" or "key"
+				keyValues[k] = ""
+			}
+			continue
 		}
+
+		// process "key=val" or "key=val=foo"
+		keyValues[k] = kv[1]
 	}
-	return false
+
+	return keyValues
 }
 
 // RoundUpSize calculates how many allocation units are needed to accommodate
@@ -72,21 +107,120 @@ func RoundUpSize(volumeSizeBytes int64, allocationUnitBytes int64) int64 {
 	return roundedUp
 }
 
-// RoundUpSizeInt calculates how many allocation units are needed to accommodate
-// a volume of given size. It returns an int instead of an int64 and an error if
-// there's overflow
-func RoundUpSizeInt(volumeSizeBytes int64, allocationUnitBytes int64) (int, error) {
-	roundedUp := RoundUpSize(volumeSizeBytes, allocationUnitBytes)
-	roundedUpInt := int(roundedUp)
-	if int64(roundedUpInt) != roundedUp {
-		return 0, fmt.Errorf("capacity %v is too great, casting results in integer overflow", roundedUp)
+// PatchService makes patch request to the Service object.
+func PatchService(ctx context.Context, client clientset.Interface, cur, mod *v1.Service) error {
+	curJSON, err := json.Marshal(cur)
+	if err != nil {
+		return fmt.Errorf("failed to serialize current service object: %v", err)
 	}
-	return roundedUpInt, nil
+
+	modJSON, err := json.Marshal(mod)
+	if err != nil {
+		return fmt.Errorf("failed to serialize modified service object: %v", err)
+	}
+
+	patch, err := strategicpatch.CreateTwoWayMergePatch(curJSON, modJSON, v1.Service{})
+	if err != nil {
+		return fmt.Errorf("failed to create 2-way merge patch: %v", err)
+	}
+	if len(patch) == 0 || string(patch) == "{}" {
+		return nil
+	}
+	_, err = client.CoreV1().Services(cur.Namespace).Patch(ctx, cur.Name, types.StrategicMergePatchType, patch, metav1.PatchOptions{})
+	if err != nil {
+		return fmt.Errorf("failed to patch service object %s/%s: %v", cur.Namespace, cur.Name, err)
+	}
+
+	return nil
 }
 
-// RoundUpToGiBInt rounds up given quantity upto chunks of GiB. It returns an
-// int instead of an int64 and an error if there's overflow
-func RoundUpToGiBInt(size resource.Quantity) (int, error) {
-	requestBytes := size.Value()
-	return RoundUpSizeInt(requestBytes, GIB)
+func SanitizeLabel(input string) string {
+	// Replace non-alphanumeric characters (except '-', '_', '.') with '-'
+	reg := regexp.MustCompile(`[^-a-zA-Z0-9_.]+`)
+	sanitized := reg.ReplaceAllString(input, "-")
+
+	// Ensure the label starts and ends with an alphanumeric character
+	sanitized = strings.Trim(sanitized, "-_.")
+
+	// Ensure the label is not longer than 63 characters
+	if len(sanitized) > 63 {
+		sanitized = sanitized[:63]
+	}
+
+	return sanitized
+}
+
+// SetMapIfNotEmpty sets the value of the key in the provided map if the value
+// is not empty (i.e., it is not the zero value for that type) and returns a
+// pointer to the new map. If the map is nil, it will be initialized with a new
+// map.
+func SetMapIfNotEmpty[K comparable, V comparable](m map[K]V, key K, value V) map[K]V {
+	// Check if the value is the zero value for its type
+	var zeroValue V
+	if value == zeroValue {
+		return m
+	}
+
+	// Initialize the map if it's nil
+	if m == nil {
+		m = make(map[K]V)
+	}
+
+	// Set the value in the map
+	m[key] = value
+
+	return m
+}
+
+// SplitTrim splits a string of values separated by sep rune into a slice of
+// strings with trimmed spaces.
+func SplitTrim(s string, sep rune) []string {
+	f := func(c rune) bool {
+		return unicode.IsSpace(c) || c == sep
+	}
+	return strings.FieldsFunc(s, f)
+}
+
+// Unique returns slice with duplicates removed, preserving first-seen order.
+func Unique[T comparable](slice []T) []T {
+	seen := make(map[T]struct{}, len(slice))
+	result := make([]T, 0, len(slice))
+	for _, item := range slice {
+		if _, ok := seen[item]; !ok {
+			seen[item] = struct{}{}
+			result = append(result, item)
+		}
+	}
+	return result
+}
+
+// Merge appends the items of src that are not already in dest, preserving
+// order. It returns the merged slice and true if any item was added.
+func Merge[T comparable](dest, src []T) ([]T, bool) {
+	existing := make(map[T]struct{}, len(dest))
+	for _, item := range dest {
+		existing[item] = struct{}{}
+	}
+
+	merged := false
+	result := make([]T, len(dest), len(dest)+len(src))
+	copy(result, dest)
+
+	for _, item := range src {
+		if _, ok := existing[item]; !ok {
+			existing[item] = struct{}{}
+			result = append(result, item)
+			merged = true
+		}
+	}
+	return result, merged
+}
+
+// UUID converts a string to a valid UUID string.
+func UUID(s string) (string, error) {
+	u, err := uuid.Parse(s)
+	if err != nil {
+		return "", err
+	}
+	return u.String(), nil
 }

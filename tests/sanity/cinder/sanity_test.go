@@ -1,38 +1,40 @@
 package sanity
 
 import (
-	"io/ioutil"
 	"os"
 	"path"
 	"testing"
 
-	"github.com/kubernetes-csi/csi-test/v3/pkg/sanity"
+	"github.com/kubernetes-csi/csi-test/v5/pkg/sanity"
 	"k8s.io/cloud-provider-openstack/pkg/csi/cinder"
 	"k8s.io/cloud-provider-openstack/pkg/csi/cinder/openstack"
 )
 
 // start sanity test for driver
 func TestDriver(t *testing.T) {
-	basePath, err := ioutil.TempDir("", "cinder.csi.openstack.org")
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	defer os.RemoveAll(basePath)
+	basePath := os.TempDir()
+	defer os.Remove(basePath)
 
 	socket := path.Join(basePath, "csi.sock")
 	endpoint := "unix://" + socket
 	cluster := "kubernetes"
-	nodeID := "fake-node"
 
-	d := cinder.NewDriver(nodeID, endpoint, cluster)
+	d := cinder.NewDriver(&cinder.DriverOpts{Endpoint: endpoint, ClusterID: cluster, WithTopology: true})
+
 	fakecloudprovider := getfakecloud()
-	openstack.OsInstance = fakecloudprovider
+	openstack.OsInstances = map[string]openstack.IOpenStack{
+		"": fakecloudprovider,
+	}
 
 	fakemnt := GetFakeMountProvider()
-	fakemet := &fakemetadata{}
+	fakemeta := &fakemetadata{}
+	fakeOpts := openstack.BlockStorageOpts{
+		RescanOnResize:        false,
+		NodeVolumeAttachLimit: 200,
+	}
 
-	d.SetupDriver(fakecloudprovider, fakemnt, fakemet)
+	d.SetupControllerService(openstack.OsInstances, nil)
+	d.SetupNodeService(fakemnt, fakemeta, fakeOpts, map[string]string{}, nil, nil, "", openstack.OsInstances)
 
 	// TODO: Stop call
 

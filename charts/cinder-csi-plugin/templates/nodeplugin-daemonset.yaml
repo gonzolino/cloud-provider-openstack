@@ -2,8 +2,13 @@ kind: DaemonSet
 apiVersion: apps/v1
 metadata:
   name: {{ include "cinder-csi.name" . }}-nodeplugin
+  namespace: {{ .Release.Namespace }}
   labels:
     {{- include "cinder-csi.nodeplugin.labels" . | nindent 4 }}
+  annotations:
+    {{- with .Values.commonAnnotations }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
 spec:
   selector:
     matchLabels:
@@ -11,68 +16,133 @@ spec:
   template:
     metadata:
       labels:
-        {{- include "cinder-csi.nodeplugin.labels" . | nindent 8 }}
+        {{- include "cinder-csi.nodeplugin.podLabels" . | nindent 8 }}
+      annotations:
+        {{- include "cinder-csi.nodeplugin.podAnnotations" . | nindent 8 }}
     spec:
-      tolerations:
-        - operator: Exists
       serviceAccount: csi-cinder-node-sa
+      # Host network access is usually necessary if using metadata service,
+      # since not all CNIs support link-local addresses, or if the OpenStack
+      # control plane is on a management network that is not advertised to pods
       hostNetwork: true
+      dnsPolicy: {{ .Values.csi.plugin.nodePlugin.dnsPolicy }}
+      securityContext:
+        {{- toYaml .Values.csi.plugin.nodePlugin.podSecurityContext | nindent 8 }}
       containers:
         - name: node-driver-registrar
+          securityContext:
+            {{- toYaml .Values.csi.plugin.nodePlugin.securityContext | nindent 12 }}
           image: "{{ .Values.csi.nodeDriverRegistrar.image.repository }}:{{ .Values.csi.nodeDriverRegistrar.image.tag }}"
           imagePullPolicy: {{ .Values.csi.nodeDriverRegistrar.image.pullPolicy }}
           args:
+            - "-v={{ .Values.logVerbosityLevel }}"
             - "--csi-address=$(ADDRESS)"
             - "--kubelet-registration-path=$(DRIVER_REG_SOCK_PATH)"
-          lifecycle:
-            preStop:
-              exec:
-                command: ["/bin/sh", "-c", "rm -rf /registration/cinder.csi.openstack.org /registration/cinder.csi.openstack.org-reg.sock"]
+            {{- if .Values.csi.nodeDriverRegistrar.extraArgs }}
+            {{- with .Values.csi.nodeDriverRegistrar.extraArgs }}
+            {{- tpl . $ | trim | nindent 12 }}
+            {{- end }}
+            {{- end }}
           env:
             - name: ADDRESS
               value: /csi/csi.sock
             - name: DRIVER_REG_SOCK_PATH
-              value: /var/lib/kubelet/plugins/cinder.csi.openstack.org/csi.sock
+              value: {{ .Values.csi.plugin.nodePlugin.kubeletDir }}/plugins/cinder.csi.openstack.org/csi.sock
             - name: KUBE_NODE_NAME
               valueFrom:
                 fieldRef:
                   fieldPath: spec.nodeName
-          imagePullPolicy: "IfNotPresent"
+            {{- if .Values.csi.nodeDriverRegistrar.extraEnv }}
+              {{- toYaml .Values.csi.nodeDriverRegistrar.extraEnv | nindent 12 }}
+            {{- end }}
           volumeMounts:
             - name: socket-dir
               mountPath: /csi
             - name: registration-dir
               mountPath: /registration
+          resources: {{ toYaml .Values.csi.nodeDriverRegistrar.resources | nindent 12 }}
         - name: liveness-probe
+          securityContext:
+            {{- toYaml .Values.csi.plugin.nodePlugin.securityContext | nindent 12 }}
           image: "{{ .Values.csi.livenessprobe.image.repository }}:{{ .Values.csi.livenessprobe.image.tag }}"
           imagePullPolicy: {{ .Values.csi.livenessprobe.image.pullPolicy }}
           args:
+            - "-v={{ .Values.logVerbosityLevel }}"
             - --csi-address=/csi/csi.sock
+            {{- if .Values.csi.livenessprobe.extraArgs }}
+            {{- with .Values.csi.livenessprobe.extraArgs }}
+            {{- tpl . $ | trim | nindent 12 }}
+            {{- end }}
+            {{- end }}
+          env:
+            {{- if .Values.csi.livenessprobe.extraEnv }}
+              {{- toYaml .Values.csi.livenessprobe.extraEnv | nindent 12 }}
+            {{- end }}
           volumeMounts:
             - name: socket-dir
               mountPath: /csi
+          resources: {{ toYaml .Values.csi.livenessprobe.resources | nindent 12 }}
+      {{- if .Values.csi.osbrickSidecar.enabled }}
+        - name: osbrick-sidecar
+          securityContext:
+            privileged: true
+          image: "{{ .Values.csi.osbrickSidecar.image.repository }}:{{ .Values.csi.osbrickSidecar.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.csi.osbrickSidecar.image.pullPolicy }}
+          volumeMounts:
+            - name: osbrick-socket
+              mountPath: /var/run/osbrick
+            - name: host-dev
+              mountPath: /dev
+            - name: host-sys
+              mountPath: /sys
+              readOnly: true
+            - name: host-run
+              mountPath: /host/run
+              mountPropagation: "Bidirectional"
+            - name: host-iscsi
+              mountPath: /etc/iscsi
+            - name: ceph-config
+              mountPath: /etc/ceph
+              readOnly: true
+            - name: host-lib-modules
+              mountPath: /lib/modules
+              readOnly: true
+          resources: {{ toYaml .Values.csi.osbrickSidecar.resources | nindent 12 }}
+      {{- end }}
         - name: cinder-csi-plugin
           securityContext:
             privileged: true
-            capabilities:
-              add: ["SYS_ADMIN"]
             allowPrivilegeEscalation: true
           image: "{{ .Values.csi.plugin.image.repository }}:{{ .Values.csi.plugin.image.tag | default .Chart.AppVersion }}"
           imagePullPolicy: {{ .Values.csi.plugin.image.pullPolicy }}
           args:
             - /bin/cinder-csi-plugin
-            - "--nodeid=$(NODE_ID)"
+            - "-v={{ .Values.logVerbosityLevel }}"
             - "--endpoint=$(CSI_ENDPOINT)"
+            - "--provide-controller-service=false"
             - "--cloud-config=$(CLOUD_CONFIG)"
+            - "--with-topology={{ .Values.csi.provisioner.topology }}"
+            {{- if .Values.csi.osbrickSidecar.enabled }}
+            - "--attach-mode=direct"
+            {{- end }}
+            {{- if .Values.csi.plugin.extraArgs }}
+            {{- with .Values.csi.plugin.extraArgs }}
+            {{- tpl . $ | trim | nindent 12 }}
+            {{- end }}
+            {{- end }}
+            {{- if .Values.csi.plugin.nodePlugin.extraArgs }}
+            {{- with .Values.csi.plugin.nodePlugin.extraArgs }}
+            {{- tpl . $ | trim | nindent 12 }}
+            {{- end }}
+            {{- end }}
           env:
-            - name: NODE_ID
-              valueFrom:
-                fieldRef:
-                  fieldPath: spec.nodeName
             - name: CSI_ENDPOINT
               value: unix://csi/csi.sock
             - name: CLOUD_CONFIG
-              value: /etc/kubernetes/cloud-config
+              value: /etc/config/{{ .Values.secret.filename }}
+            {{- if .Values.csi.plugin.extraEnv }}
+              {{- toYaml .Values.csi.plugin.extraEnv | nindent 12 }}
+            {{- end }}
           ports:
             - containerPort: 9808
               name: healthz
@@ -86,29 +156,35 @@ spec:
             initialDelaySeconds: {{ .Values.csi.livenessprobe.initialDelaySeconds }}
             timeoutSeconds: {{ .Values.csi.livenessprobe.timeoutSeconds }}
             periodSeconds: {{ .Values.csi.livenessprobe.periodSeconds }}
-          imagePullPolicy: "IfNotPresent"
           volumeMounts:
             - name: socket-dir
               mountPath: /csi
             - name: kubelet-dir
-              mountPath: /var/lib/kubelet
+              mountPath: {{ .Values.csi.plugin.nodePlugin.kubeletDir }}
               mountPropagation: "Bidirectional"
             - name: pods-probe-dir
               mountPath: /dev
               mountPropagation: "HostToContainer"
-            {{- .Values.csi.plugin.volumeMounts | toYaml | trimSuffix "\n" | nindent 12 }}
+          {{- with .Values.csi.plugin.volumeMounts }}
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- if .Values.csi.osbrickSidecar.enabled }}
+            - name: osbrick-socket
+              mountPath: /var/run/osbrick
+          {{- end }}
+          resources: {{ toYaml .Values.csi.plugin.resources | nindent 12 }}
       volumes:
         - name: socket-dir
           hostPath:
-            path: /var/lib/kubelet/plugins/cinder.csi.openstack.org
+            path: {{ .Values.csi.plugin.nodePlugin.kubeletDir }}/plugins/cinder.csi.openstack.org
             type: DirectoryOrCreate
         - name: registration-dir
           hostPath:
-            path: /var/lib/kubelet/plugins_registry/
+            path: {{ .Values.csi.plugin.nodePlugin.kubeletDir }}/plugins_registry/
             type: Directory
         - name: kubelet-dir
           hostPath:
-            path: /var/lib/kubelet
+            path: {{ .Values.csi.plugin.nodePlugin.kubeletDir }}
             type: Directory
         # - name: pods-cloud-data
         #   hostPath:
@@ -118,12 +194,57 @@ spec:
           hostPath:
             path: /dev
             type: Directory
-        - name: cloud-config
         {{- if .Values.secret.enabled }}
+        - name: cloud-config
           secret:
             secretName: {{ .Values.secret.name }}
-        {{- else }}
+        {{- else if .Values.secret.hostMount }}
+        - name: cloud-config
           hostPath:
-            path: /etc/kubernetes
+            path: /etc/config
         {{- end }}
-        {{ .Values.csi.plugin.volumes | toYaml | trimSuffix "\n" | nindent 8 }}
+        {{- with .Values.csi.plugin.volumes }}
+          {{- toYaml . | nindent 8 }}
+        {{- end }}
+        {{- if .Values.csi.osbrickSidecar.enabled }}
+        - name: osbrick-socket
+          emptyDir: {}
+        - name: host-dev
+          hostPath:
+            path: /dev
+            type: Directory
+        - name: host-sys
+          hostPath:
+            path: /sys
+            type: Directory
+        - name: host-run
+          hostPath:
+            path: /run
+            type: Directory
+        - name: host-iscsi
+          hostPath:
+            path: /etc/iscsi
+            type: DirectoryOrCreate
+        - name: ceph-config
+          secret:
+            secretName: {{ (.Values.csi.osbrickSidecar.cephSecret).name | default "ceph-config" }}
+            optional: true
+        - name: host-lib-modules
+          hostPath:
+            path: /lib/modules
+            type: Directory
+        {{- end }}
+      affinity: {{ toYaml .Values.csi.plugin.nodePlugin.affinity | nindent 8 }}
+      nodeSelector: {{ toYaml .Values.csi.plugin.nodePlugin.nodeSelector | nindent 8 }}
+      tolerations: {{ toYaml .Values.csi.plugin.nodePlugin.tolerations | nindent 8 }}
+      {{- with .Values.csi.plugin.nodePlugin.hostAliases }}
+      hostAliases:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    {{- if .Values.csi.plugin.nodePlugin.priorityClassName }}
+      priorityClassName: {{ .Values.csi.plugin.nodePlugin.priorityClassName }}
+    {{- end }}
+    {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+    {{- end }}

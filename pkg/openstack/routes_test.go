@@ -21,8 +21,10 @@ import (
 	"net"
 	"testing"
 
-	"github.com/gophercloud/gophercloud/openstack/compute/v2/servers"
-	"github.com/gophercloud/gophercloud/openstack/networking/v2/extensions/layer3/routers"
+	"github.com/gophercloud/gophercloud/v2/openstack/compute/v2/servers"
+	"github.com/gophercloud/gophercloud/v2/openstack/networking/v2/extensions/layer3/routers"
+	v1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	cloudprovider "k8s.io/cloud-provider"
 	"k8s.io/cloud-provider-openstack/pkg/client"
@@ -36,12 +38,11 @@ func TestRoutes(t *testing.T) {
 
 	os, err := NewOpenStack(cfg)
 	if err != nil {
-		t.Fatalf("Failed to construct/authenticate OpenStack: %s", err)
+		t.Fatalf("Failed to construct/authenticate OpenStack: %v", err)
 	}
 
 	vms := getServers(os)
-	_, err = os.InstanceID()
-	if err != nil || len(vms) == 0 {
+	if len(vms) == 0 {
 		t.Skipf("Please run this test in an OpenStack vm or create at least one VM in OpenStack before you run this test.")
 	}
 
@@ -84,12 +85,91 @@ func TestRoutes(t *testing.T) {
 	}
 }
 
+func TestGetAddrByNodeName(t *testing.T) {
+	fixtures := [][]*v1.Node{
+		{
+			{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "test-node-1",
+				},
+				Status: v1.NodeStatus{
+					Addresses: []v1.NodeAddress{
+						{
+							Type:    v1.NodeInternalIP,
+							Address: "2001:4800:790e::82a8",
+						},
+						{
+							Type:    v1.NodeInternalIP,
+							Address: "1.2.3.4",
+						},
+						{
+							Type:    v1.NodeInternalIP,
+							Address: "2001:4800:790e::82a9",
+						},
+					},
+				},
+			},
+		},
+		{
+			{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "test-node-1",
+				},
+				Status: v1.NodeStatus{
+					Addresses: []v1.NodeAddress{
+						{
+							Type:    v1.NodeInternalIP,
+							Address: "1.2.3.5",
+						},
+						{
+							Type:    v1.NodeInternalIP,
+							Address: "2001:4800:790e::82a8",
+						},
+						{
+							Type:    v1.NodeInternalIP,
+							Address: "1.2.3.4",
+						},
+						{
+							Type:    v1.NodeInternalIP,
+							Address: "2001:4800:790e::82a9",
+						},
+					},
+				},
+			},
+		},
+	}
+	tests := []struct {
+		ipv6 bool
+		ip   string
+	}{
+		{
+			ipv6: false,
+			ip:   "1.2.3.4",
+		},
+		{
+			ipv6: true,
+			ip:   "2001:4800:790e::82a8",
+		},
+	}
+
+	for i, v := range fixtures {
+		ip := getAddrByNodeName("test-node-1", tests[i].ipv6, v)
+
+		if expected := tests[i].ip; expected != ip {
+			t.Fatalf("Expected %q IP doesn't correspond %q actual IP", expected, ip)
+		}
+	}
+}
+
 func getServers(os *OpenStack) []servers.Server {
 	c, err := client.NewComputeV2(os.provider, os.epOpts)
+	if err != nil {
+		panic(err)
+	}
 	opts := servers.ListOpts{
 		Status: "ACTIVE",
 	}
-	allPages, err := servers.List(c, opts).AllPages()
+	allPages, err := servers.List(c, opts).AllPages(context.TODO())
 	if err != nil {
 		panic(err)
 	}
@@ -109,7 +189,7 @@ func getRouters(os *OpenStack) []routers.Router {
 	if err != nil {
 		panic(err)
 	}
-	allPages, err := routers.List(n, listOpts).AllPages()
+	allPages, err := routers.List(n, listOpts).AllPages(context.TODO())
 	if err != nil {
 		panic(err)
 	}

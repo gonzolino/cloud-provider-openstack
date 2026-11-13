@@ -3,12 +3,8 @@ apiVersion: rbac.authorization.k8s.io/v1
 metadata:
   name: {{ include "openstack-manila-csi.controllerplugin.fullname" . }}-rules
   labels:
-    app: {{ include "openstack-manila-csi.name" . }}
-    chart: {{ include "openstack-manila-csi.chart" . }}
-    component: {{ .Values.controllerplugin.name }}
-    release: {{ .Release.Name }}
-    heritage: {{ .Release.Service }}
-    rbac.manila.csi.openstack.org/aggregate-to-{{ include "openstack-manila-csi.controllerplugin.fullname" . }}: "true"
+    {{- include "openstack-manila-csi.controllerplugin.labels" .  | nindent 4 }}
+    rbac.manila.csi.openstack.org/aggregate-to-controller-{{ include "openstack-manila-csi.name" . }}: "true"
 rules:
   - apiGroups: [""]
     resources: ["nodes"]
@@ -18,10 +14,13 @@ rules:
     verbs: ["get", "list"]
   - apiGroups: [""]
     resources: ["persistentvolumes"]
-    verbs: ["get", "list", "watch", "create", "delete"]
+    verbs: ["get", "list", "watch", "create", "delete", "patch"]
   - apiGroups: [""]
     resources: ["persistentvolumeclaims"]
     verbs: ["get", "list", "watch", "update"]
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims/status"]
+    verbs: ["patch"]
   - apiGroups: [""]
     resources: ["events"]
     verbs: ["list", "watch", "create", "update", "patch"]
@@ -39,7 +38,7 @@ rules:
     verbs: ["get", "list"]
   - apiGroups: ["snapshot.storage.k8s.io"]
     resources: ["volumesnapshotcontents"]
-    verbs: ["create", "get", "list", "watch", "update", "delete"]
+    verbs: ["create", "get", "list", "watch", "update", "delete", "patch"]
   - apiGroups: ["snapshot.storage.k8s.io"]
     resources: ["volumesnapshotcontents/status"]
-    verbs: ["update"]
+    verbs: ["update", "patch"]

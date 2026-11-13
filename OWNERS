@@ -1,18 +1,18 @@
+emeritus_approvers:
+- chrigl
+- lingxiankong
+- ramineni
+- jichenjc
+- dulek
 approvers:
-- adisky
-- chrigl
-- dims
-- lingxiankong
-- ramineni
+- kayrus
+- mandre
+- stephenfin
 - zetaab
-- jichenjc
 reviewers:
-- adisky
-- chrigl
-- dims
-- Fedosin
-- jichenjc
-- lingxiankong
-- ramineni
-- ricolin
+- gouthampacha
+- kayrus
+- mandre
+- stephenfin
+- winiciusallan
 - zetaab

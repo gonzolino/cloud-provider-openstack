@@ -17,35 +17,32 @@ limitations under the License.
 package manila
 
 import (
+	"context"
 	"errors"
 	"fmt"
-	"strconv"
 	"strings"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
-	"github.com/gophercloud/gophercloud/openstack/sharedfilesystems/v2/messages"
-	"github.com/gophercloud/gophercloud/openstack/sharedfilesystems/v2/shares"
-	"github.com/gophercloud/gophercloud/openstack/sharedfilesystems/v2/snapshots"
+	"github.com/gophercloud/gophercloud/v2/openstack/sharedfilesystems/v2/messages"
+	"github.com/gophercloud/gophercloud/v2/openstack/sharedfilesystems/v2/shares"
+	"github.com/gophercloud/gophercloud/v2/openstack/sharedfilesystems/v2/snapshots"
 	"google.golang.org/grpc/codes"
-	"k8s.io/cloud-provider-openstack/pkg/csi/manila/capabilities"
-	"k8s.io/cloud-provider-openstack/pkg/csi/manila/compatibility"
 	"k8s.io/cloud-provider-openstack/pkg/csi/manila/manilaclient"
 	"k8s.io/cloud-provider-openstack/pkg/csi/manila/options"
 	"k8s.io/klog/v2"
 )
 
 type (
-	volumeID   string
-	snapshotID string
+	volumeID string
 )
 
 const (
-	bytesInGiB = 1024 * 1024 * 1024
+	bytesInGiB int64 = 1024 * 1024 * 1024
 )
 
 type manilaError int
 
-func (c manilaError) toRpcErrorCode() codes.Code {
+func (c manilaError) toRPCErrorCode() codes.Code {
 	switch c {
 	case manilaErrNoValidHost:
 		return codes.OutOfRange
@@ -71,6 +68,7 @@ const (
 )
 
 var (
+	// TODO: add 001 and add a refernce to these codes
 	manilaErrorCodesMap = map[string]manilaError{
 		"002": manilaErrNoValidHost,
 		"003": manilaErrUnexpectedNetwork,
@@ -124,16 +122,16 @@ func fmtGrpcConnError(fwdEndpoint string, err error) string {
 func bytesToGiB(sizeInBytes int64) int {
 	sizeInGiB := int(sizeInBytes / bytesInGiB)
 
-	if int64(sizeInGiB)*bytesInGiB < sizeInBytes {
+	if sizeInBytes%bytesInGiB > 0 {
 		// Round up
-		return sizeInGiB + 1
+		sizeInGiB++
 	}
 
 	return sizeInGiB
 }
 
-func lastResourceError(resourceID string, manilaClient manilaclient.Interface) (manilaErrorMessage, error) {
-	msgs, err := manilaClient.GetUserMessages(&messages.ListOpts{
+func lastResourceError(ctx context.Context, manilaClient manilaclient.Interface, resourceID string) (manilaErrorMessage, error) {
+	msgs, err := manilaClient.GetUserMessages(ctx, &messages.ListOpts{
 		ResourceID:   resourceID,
 		MessageLevel: "ERROR",
 		Limit:        1,
@@ -145,7 +143,7 @@ func lastResourceError(resourceID string, manilaClient manilaclient.Interface) (
 		return manilaErrorMessage{}, err
 	}
 
-	if msgs != nil && len(msgs) == 1 {
+	if len(msgs) == 1 {
 		return manilaErrorMessage{errCode: manilaErrorCodesMap[msgs[0].DetailID], message: msgs[0].UserMessage}, nil
 	}
 
@@ -153,19 +151,7 @@ func lastResourceError(resourceID string, manilaClient manilaclient.Interface) (
 }
 
 func compareProtocol(protoA, protoB string) bool {
-	return strings.ToUpper(protoA) == strings.ToUpper(protoB)
-}
-
-func tryCompatForVolumeSource(compatOpts *options.CompatibilityOptions, shareOpts *options.ControllerVolumeContext, source *csi.VolumeContentSource, shareTypeCaps capabilities.ManilaCapabilities) compatibility.Layer {
-	if source != nil {
-		if source.GetSnapshot() != nil && shareTypeCaps[capabilities.ManilaCapabilitySnapshot] {
-			if createShareFromSnapshotEnabled, _ := strconv.ParseBool(compatOpts.CreateShareFromSnapshotEnabled); createShareFromSnapshotEnabled {
-				return compatibility.FindCompatibilityLayer(shareOpts.Protocol, capabilities.ManilaCapabilityShareFromSnapshot, shareTypeCaps)
-			}
-		}
-	}
-
-	return nil
+	return strings.EqualFold(protoA, protoB)
 }
 
 //
@@ -247,7 +233,7 @@ func coalesceValue(v string) string {
 	return v
 }
 
-func verifyVolumeCompatibility(sizeInGiB int, req *csi.CreateVolumeRequest, share *shares.Share, shareOpts *options.ControllerVolumeContext, compatOpts *options.CompatibilityOptions, shareTypeCaps capabilities.ManilaCapabilities) error {
+func verifyVolumeCompatibility(sizeInGiB int, req *csi.CreateVolumeRequest, share *shares.Share, shareOpts *options.ControllerVolumeContext) error {
 	if share.Size != sizeInGiB {
 		return fmt.Errorf("size mismatch: wanted %d, got %d", share.Size, sizeInGiB)
 	}
@@ -298,6 +284,22 @@ func validateValidateVolumeCapabilitiesRequest(req *csi.ValidateVolumeCapabiliti
 
 	if req.GetSecrets() == nil || len(req.GetSecrets()) == 0 {
 		return errors.New("stage secrets cannot be nil or empty")
+	}
+
+	return nil
+}
+
+func validateControllerExpandVolumeRequest(req *csi.ControllerExpandVolumeRequest) error {
+	if req.GetVolumeId() == "" {
+		return errors.New("volume ID missing in request")
+	}
+
+	if req.GetCapacityRange() == nil {
+		return errors.New("capacity range cannot be nil")
+	}
+
+	if req.GetSecrets() == nil || len(req.GetSecrets()) == 0 {
+		return errors.New("volume expand secrets cannot be nil or empty")
 	}
 
 	return nil

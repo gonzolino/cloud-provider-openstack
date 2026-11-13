@@ -17,84 +17,131 @@ limitations under the License.
 package manilaclient
 
 import (
-	"github.com/gophercloud/gophercloud"
-	"github.com/gophercloud/gophercloud/openstack/sharedfilesystems/v2/messages"
-	"github.com/gophercloud/gophercloud/openstack/sharedfilesystems/v2/shares"
-	"github.com/gophercloud/gophercloud/openstack/sharedfilesystems/v2/sharetypes"
-	"github.com/gophercloud/gophercloud/openstack/sharedfilesystems/v2/snapshots"
-	shares_utils "github.com/gophercloud/utils/openstack/sharedfilesystems/v2/shares"
-	sharetypes_utils "github.com/gophercloud/utils/openstack/sharedfilesystems/v2/sharetypes"
-	snapshots_utils "github.com/gophercloud/utils/openstack/sharedfilesystems/v2/snapshots"
+	"context"
+
+	"github.com/gophercloud/gophercloud/v2"
+	"github.com/gophercloud/gophercloud/v2/openstack/sharedfilesystems/v2/messages"
+	"github.com/gophercloud/gophercloud/v2/openstack/sharedfilesystems/v2/shareaccessrules"
+	"github.com/gophercloud/gophercloud/v2/openstack/sharedfilesystems/v2/shares"
+	"github.com/gophercloud/gophercloud/v2/openstack/sharedfilesystems/v2/sharetypes"
+	"github.com/gophercloud/gophercloud/v2/openstack/sharedfilesystems/v2/snapshots"
+	shares_utils "github.com/gophercloud/utils/v2/openstack/sharedfilesystems/v2/shares"
+	sharetypes_utils "github.com/gophercloud/utils/v2/openstack/sharedfilesystems/v2/sharetypes"
+	snapshots_utils "github.com/gophercloud/utils/v2/openstack/sharedfilesystems/v2/snapshots"
 )
 
 type Client struct {
 	c *gophercloud.ServiceClient
 }
 
-func (c Client) GetShareByID(shareID string) (*shares.Share, error) {
-	return shares.Get(c.c, shareID).Extract()
+func (c Client) GetMicroversion() string {
+	return c.c.Microversion
 }
 
-func (c Client) GetShareByName(shareName string) (*shares.Share, error) {
-	shareID, err := shares_utils.IDFromName(c.c, shareName)
+func (c Client) SetMicroversion(version string) {
+	c.c.Microversion = version
+}
+
+func (c Client) GetShareByID(ctx context.Context, shareID string) (*shares.Share, error) {
+	return shares.Get(ctx, c.c, shareID).Extract()
+}
+
+func (c Client) GetShareByName(ctx context.Context, shareName string) (*shares.Share, error) {
+	shareID, err := shares_utils.IDFromName(ctx, c.c, shareName)
 	if err != nil {
 		return nil, err
 	}
 
-	return shares.Get(c.c, shareID).Extract()
+	return shares.Get(ctx, c.c, shareID).Extract()
 }
 
-func (c Client) CreateShare(opts shares.CreateOptsBuilder) (*shares.Share, error) {
-	return shares.Create(c.c, opts).Extract()
+func (c Client) CreateShare(ctx context.Context, opts shares.CreateOptsBuilder) (*shares.Share, error) {
+	return shares.Create(ctx, c.c, opts).Extract()
 }
 
-func (c Client) DeleteShare(shareID string) error {
-	return shares.Delete(c.c, shareID).ExtractErr()
+func (c Client) DeleteShare(ctx context.Context, shareID string) error {
+	return shares.Delete(ctx, c.c, shareID).ExtractErr()
 }
 
-func (c Client) GetExportLocations(shareID string) ([]shares.ExportLocation, error) {
-	return shares.ListExportLocations(c.c, shareID).Extract()
+func (c Client) ExtendShare(ctx context.Context, shareID string, opts shares.ExtendOptsBuilder) error {
+	return shares.Extend(ctx, c.c, shareID, opts).ExtractErr()
 }
 
-func (c Client) SetShareMetadata(shareID string, opts shares.SetMetadataOptsBuilder) (map[string]string, error) {
-	return shares.SetMetadata(c.c, shareID, opts).Extract()
+func (c Client) GetExportLocations(ctx context.Context, shareID string) ([]shares.ExportLocation, error) {
+	return shares.ListExportLocations(ctx, c.c, shareID).Extract()
 }
 
-func (c Client) GetAccessRights(shareID string) ([]shares.AccessRight, error) {
-	return shares.ListAccessRights(c.c, shareID).Extract()
+func (c Client) SetShareMetadata(ctx context.Context, shareID string, opts shares.SetMetadataOptsBuilder) (map[string]string, error) {
+	return shares.SetMetadata(ctx, c.c, shareID, opts).Extract()
 }
 
-func (c Client) GrantAccess(shareID string, opts shares.GrantAccessOptsBuilder) (*shares.AccessRight, error) {
-	return shares.GrantAccess(c.c, shareID, opts).Extract()
-}
+func (c Client) GetAccessRights(ctx context.Context, shareID string) ([]shares.AccessRight, error) {
+	// Set microversion to 2.45 to use the GET /share-access-rules endpoint
+	v := c.GetMicroversion()
+	c.SetMicroversion("2.45")
+	defer c.SetMicroversion(v)
 
-func (c Client) GetSnapshotByID(snapID string) (*snapshots.Snapshot, error) {
-	return snapshots.Get(c.c, snapID).Extract()
-}
-
-func (c Client) GetSnapshotByName(snapName string) (*snapshots.Snapshot, error) {
-	snapID, err := snapshots_utils.IDFromName(c.c, snapName)
+	rules, err := shareaccessrules.List(ctx, c.c, shareID).Extract()
 	if err != nil {
 		return nil, err
 	}
 
-	return snapshots.Get(c.c, snapID).Extract()
+	return toAccessRights(rules), nil
 }
 
-func (c Client) CreateSnapshot(opts snapshots.CreateOptsBuilder) (*snapshots.Snapshot, error) {
-	return snapshots.Create(c.c, opts).Extract()
+// toAccessRights adapts the shareaccessrules API type to the shares.AccessRight type
+func toAccessRights(rules []shareaccessrules.ShareAccess) []shares.AccessRight {
+	accessRights := make([]shares.AccessRight, len(rules))
+	for i, r := range rules {
+		accessRights[i] = shares.AccessRight{
+			ShareID:     r.ShareID,
+			AccessType:  r.AccessType,
+			AccessTo:    r.AccessTo,
+			AccessKey:   r.AccessKey,
+			AccessLevel: r.AccessLevel,
+			State:       r.State,
+			ID:          r.ID,
+		}
+	}
+
+	return accessRights
 }
 
-func (c Client) DeleteSnapshot(snapID string) error {
-	return snapshots.Delete(c.c, snapID).ExtractErr()
+func (c Client) GrantAccess(ctx context.Context, shareID string, opts shares.GrantAccessOptsBuilder) (*shares.AccessRight, error) {
+	return shares.GrantAccess(ctx, c.c, shareID, opts).Extract()
 }
 
-func (c Client) GetExtraSpecs(shareTypeID string) (sharetypes.ExtraSpecs, error) {
-	return sharetypes.GetExtraSpecs(c.c, shareTypeID).Extract()
+func (c Client) RevokeAccess(ctx context.Context, shareID string, accessID string) error {
+	return shares.RevokeAccess(ctx, c.c, shareID, shares.RevokeAccessOpts{AccessID: accessID}).ExtractErr()
 }
 
-func (c Client) GetShareTypes() ([]sharetypes.ShareType, error) {
-	allPages, err := sharetypes.List(c.c, sharetypes.ListOpts{}).AllPages()
+func (c Client) GetSnapshotByID(ctx context.Context, snapID string) (*snapshots.Snapshot, error) {
+	return snapshots.Get(ctx, c.c, snapID).Extract()
+}
+
+func (c Client) GetSnapshotByName(ctx context.Context, snapName string) (*snapshots.Snapshot, error) {
+	snapID, err := snapshots_utils.IDFromName(ctx, c.c, snapName)
+	if err != nil {
+		return nil, err
+	}
+
+	return snapshots.Get(ctx, c.c, snapID).Extract()
+}
+
+func (c Client) CreateSnapshot(ctx context.Context, opts snapshots.CreateOptsBuilder) (*snapshots.Snapshot, error) {
+	return snapshots.Create(ctx, c.c, opts).Extract()
+}
+
+func (c Client) DeleteSnapshot(ctx context.Context, snapID string) error {
+	return snapshots.Delete(ctx, c.c, snapID).ExtractErr()
+}
+
+func (c Client) GetExtraSpecs(ctx context.Context, shareTypeID string) (sharetypes.ExtraSpecs, error) {
+	return sharetypes.GetExtraSpecs(ctx, c.c, shareTypeID).Extract()
+}
+
+func (c Client) GetShareTypes(ctx context.Context) ([]sharetypes.ShareType, error) {
+	allPages, err := sharetypes.List(c.c, sharetypes.ListOpts{}).AllPages(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -102,12 +149,12 @@ func (c Client) GetShareTypes() ([]sharetypes.ShareType, error) {
 	return sharetypes.ExtractShareTypes(allPages)
 }
 
-func (c Client) GetShareTypeIDFromName(shareTypeName string) (string, error) {
-	return sharetypes_utils.IDFromName(c.c, shareTypeName)
+func (c Client) GetShareTypeIDFromName(ctx context.Context, shareTypeName string) (string, error) {
+	return sharetypes_utils.IDFromName(ctx, c.c, shareTypeName)
 }
 
-func (c Client) GetUserMessages(opts messages.ListOptsBuilder) ([]messages.Message, error) {
-	allPages, err := messages.List(c.c, opts).AllPages()
+func (c Client) GetUserMessages(ctx context.Context, opts messages.ListOptsBuilder) ([]messages.Message, error) {
+	allPages, err := messages.List(c.c, opts).AllPages(ctx)
 	if err != nil {
 		return nil, err
 	}

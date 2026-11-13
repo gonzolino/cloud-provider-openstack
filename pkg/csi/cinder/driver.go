@@ -22,7 +22,10 @@ import (
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"k8s.io/client-go/kubernetes"
+	v1 "k8s.io/client-go/listers/core/v1"
 	"k8s.io/cloud-provider-openstack/pkg/csi/cinder/openstack"
+	"k8s.io/cloud-provider-openstack/pkg/util/brick"
 	"k8s.io/cloud-provider-openstack/pkg/util/metadata"
 	"k8s.io/cloud-provider-openstack/pkg/util/mount"
 	"k8s.io/cloud-provider-openstack/pkg/version"
@@ -32,21 +35,48 @@ import (
 const (
 	driverName  = "cinder.csi.openstack.org"
 	topologyKey = "topology." + driverName + "/zone"
+
+	// maxVolumesPerNode is the maximum number of volumes that can be attached to a node
+	maxVolumesPerNode = 256
+
+	// ResizeRequired parameter, if set to true, will trigger a resize on mount operation
+	ResizeRequired = driverName + "/resizeRequired"
+
+	// AttachModeNova uses Nova attach/detach for volume operations (default).
+	AttachModeNova = "nova"
+	// AttachModeDirect uses Cinder Attachment API with os-brick sidecar
+	// for direct attachment (typically bare-metal nodes).
+	AttachModeDirect = "direct"
 )
 
 var (
-	specVersion = "1.3.0"
-	// we used to use spec version as driver version, now separate them
-	Version = "1.3.0"
+	// CSI spec version
+	specVersion = "1.8.0"
+
+	// Driver version
+	// Version history:
+	// * 1.3.0: Up to version 1.3.0 driver version was the same as CSI spec version
+	// * 1.3.1: Bump for 1.21 release
+	// * 1.3.2: Allow --cloud-config to be given multiple times
+	// * 1.3.3: Bump for 1.22 release
+	// * 2.0.0: Bump for 1.23 release
+	Version = "2.0.0"
 )
 
-type CinderDriver struct {
-	name        string
-	nodeID      string
-	fqVersion   string //Fully qualified version in format {Version}@{CPO version}
-	endpoint    string
-	cloudconfig string
-	cluster     string
+// Deprecated: use Driver instead
+//
+//revive:disable:exported
+type CinderDriver = Driver
+
+//revive:enable:exported
+
+type Driver struct {
+	name         string
+	fqVersion    string //Fully qualified version in format {Version}@{CPO version}
+	endpoint     string
+	clusterID    string
+	withTopology bool
+	attachMode   string
 
 	ids *identityServer
 	cs  *controllerServer
@@ -55,20 +85,39 @@ type CinderDriver struct {
 	vcap  []*csi.VolumeCapability_AccessMode
 	cscap []*csi.ControllerServiceCapability
 	nscap []*csi.NodeServiceCapability
+
+	pvcLister v1.PersistentVolumeClaimLister
 }
 
-func NewDriver(nodeID, endpoint, cluster string) *CinderDriver {
+type DriverOpts struct {
+	ClusterID    string
+	Endpoint     string
+	WithTopology bool
+	AttachMode   string
 
-	d := &CinderDriver{}
-	d.name = driverName
-	d.nodeID = nodeID
-	d.fqVersion = fmt.Sprintf("%s@%s", Version, version.Version)
-	d.endpoint = endpoint
-	d.cluster = cluster
+	PVCLister v1.PersistentVolumeClaimLister
+}
+
+func NewDriver(o *DriverOpts) *Driver {
+	attachMode := o.AttachMode
+	if attachMode == "" {
+		attachMode = AttachModeNova
+	}
+
+	d := &Driver{
+		name:         driverName,
+		fqVersion:    fmt.Sprintf("%s@%s", Version, version.Version),
+		endpoint:     o.Endpoint,
+		clusterID:    o.ClusterID,
+		withTopology: o.WithTopology,
+		attachMode:   attachMode,
+		pvcLister:    o.PVCLister,
+	}
 
 	klog.Info("Driver: ", d.name)
 	klog.Info("Driver version: ", d.fqVersion)
 	klog.Info("CSI Spec version: ", specVersion)
+	klog.Infof("Topology awareness: %t", d.withTopology)
 
 	d.AddControllerServiceCapabilities(
 		[]csi.ControllerServiceCapability_RPC_Type{
@@ -80,21 +129,29 @@ func NewDriver(nodeID, endpoint, cluster string) *CinderDriver {
 			csi.ControllerServiceCapability_RPC_EXPAND_VOLUME,
 			csi.ControllerServiceCapability_RPC_CLONE_VOLUME,
 			csi.ControllerServiceCapability_RPC_LIST_VOLUMES_PUBLISHED_NODES,
+			csi.ControllerServiceCapability_RPC_GET_VOLUME,
 		})
-	d.AddVolumeCapabilityAccessModes([]csi.VolumeCapability_AccessMode_Mode{csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER})
+	d.AddVolumeCapabilityAccessModes(
+		[]csi.VolumeCapability_AccessMode_Mode{
+			csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER,
+		})
 
-	d.AddNodeServiceCapabilities(
+	// ignoring error, because AddNodeServiceCapabilities is public
+	// and so potentially used somewhere else.
+	_ = d.AddNodeServiceCapabilities(
 		[]csi.NodeServiceCapability_RPC_Type{
 			csi.NodeServiceCapability_RPC_STAGE_UNSTAGE_VOLUME,
 			csi.NodeServiceCapability_RPC_EXPAND_VOLUME,
 			csi.NodeServiceCapability_RPC_GET_VOLUME_STATS,
 		})
 
+	d.ids = NewIdentityServer(d)
+
 	return d
 }
 
-func (d *CinderDriver) AddControllerServiceCapabilities(cl []csi.ControllerServiceCapability_RPC_Type) {
-	var csc []*csi.ControllerServiceCapability
+func (d *Driver) AddControllerServiceCapabilities(cl []csi.ControllerServiceCapability_RPC_Type) {
+	csc := make([]*csi.ControllerServiceCapability, 0, len(cl))
 
 	for _, c := range cl {
 		klog.Infof("Enabling controller service capability: %v", c.String())
@@ -102,31 +159,35 @@ func (d *CinderDriver) AddControllerServiceCapabilities(cl []csi.ControllerServi
 	}
 
 	d.cscap = csc
-
-	return
 }
 
-func (d *CinderDriver) AddVolumeCapabilityAccessModes(vc []csi.VolumeCapability_AccessMode_Mode) []*csi.VolumeCapability_AccessMode {
-	var vca []*csi.VolumeCapability_AccessMode
+func (d *Driver) AddVolumeCapabilityAccessModes(vc []csi.VolumeCapability_AccessMode_Mode) []*csi.VolumeCapability_AccessMode {
+	vca := make([]*csi.VolumeCapability_AccessMode, 0, len(vc))
+
 	for _, c := range vc {
 		klog.Infof("Enabling volume access mode: %v", c.String())
 		vca = append(vca, NewVolumeCapabilityAccessMode(c))
 	}
+
 	d.vcap = vca
+
 	return vca
 }
 
-func (d *CinderDriver) AddNodeServiceCapabilities(nl []csi.NodeServiceCapability_RPC_Type) error {
-	var nsc []*csi.NodeServiceCapability
+func (d *Driver) AddNodeServiceCapabilities(nl []csi.NodeServiceCapability_RPC_Type) error {
+	nsc := make([]*csi.NodeServiceCapability, 0, len(nl))
+
 	for _, n := range nl {
 		klog.Infof("Enabling node service capability: %v", n.String())
 		nsc = append(nsc, NewNodeServiceCapability(n))
 	}
+
 	d.nscap = nsc
+
 	return nil
 }
 
-func (d *CinderDriver) ValidateControllerServiceRequest(c csi.ControllerServiceCapability_RPC_Type) error {
+func (d *Driver) ValidateControllerServiceRequest(c csi.ControllerServiceCapability_RPC_Type) error {
 	if c == csi.ControllerServiceCapability_RPC_UNKNOWN {
 		return nil
 	}
@@ -136,22 +197,34 @@ func (d *CinderDriver) ValidateControllerServiceRequest(c csi.ControllerServiceC
 			return nil
 		}
 	}
-	return status.Error(codes.InvalidArgument, fmt.Sprintf("%s", c))
+
+	return status.Error(codes.InvalidArgument, c.String())
 }
 
-func (d *CinderDriver) GetVolumeCapabilityAccessModes() []*csi.VolumeCapability_AccessMode {
+func (d *Driver) GetVolumeCapabilityAccessModes() []*csi.VolumeCapability_AccessMode {
 	return d.vcap
 }
 
-func (d *CinderDriver) SetupDriver(cloud openstack.IOpenStack, mount mount.IMount, metadata metadata.IMetadata) {
-
-	d.ids = NewIdentityServer(d)
-	d.cs = NewControllerServer(d, cloud)
-	d.ns = NewNodeServer(d, mount, metadata, cloud)
-
+// IsDirectMode returns true when the driver is configured to attach
+// volumes directly via Cinder + os-brick instead of through Nova.
+func (d *Driver) IsDirectMode() bool {
+	return d.attachMode == AttachModeDirect
 }
 
-func (d *CinderDriver) Run() {
+func (d *Driver) SetupControllerService(clouds map[string]openstack.IOpenStack, connProps ConnectorPropertiesGetter) {
+	klog.Info("Providing controller service")
+	d.cs = NewControllerServer(d, clouds, connProps)
+}
 
-	RunControllerandNodePublishServer(d.endpoint, d.ids, d.cs, d.ns)
+func (d *Driver) SetupNodeService(mount mount.IMount, metadata metadata.IMetadata, opts openstack.BlockStorageOpts, topologies map[string]string, connector brick.IConnector, kubeClient kubernetes.Interface, nodeName string, clouds map[string]openstack.IOpenStack) {
+	klog.Info("Providing node service")
+	d.ns = NewNodeServer(d, mount, metadata, opts, topologies, connector, kubeClient, nodeName, clouds)
+}
+
+func (d *Driver) Run() {
+	if nil == d.cs && nil == d.ns {
+		klog.Fatal("No CSI services initialized")
+	}
+
+	RunServicesInitialized(d.endpoint, d.ids, d.cs, d.ns)
 }

@@ -18,13 +18,15 @@ package csiclient
 
 import (
 	"context"
+	"time"
+
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"google.golang.org/grpc"
-	"time"
 )
 
 type Node interface {
 	GetCapabilities(ctx context.Context) (*csi.NodeGetCapabilitiesResponse, error)
+	GetVolumeStats(ctx context.Context, req *csi.NodeGetVolumeStatsRequest) (*csi.NodeGetVolumeStatsResponse, error)
 
 	StageVolume(ctx context.Context, req *csi.NodeStageVolumeRequest) (*csi.NodeStageVolumeResponse, error)
 	UnstageVolume(ctx context.Context, req *csi.NodeUnstageVolumeRequest) (*csi.NodeUnstageVolumeResponse, error)
@@ -36,7 +38,7 @@ type Node interface {
 type Identity interface {
 	GetPluginInfo(ctx context.Context) (*csi.GetPluginInfoResponse, error)
 	Probe(ctx context.Context, req *csi.ProbeRequest) (*csi.ProbeResponse, error)
-	ProbeForever(conn *grpc.ClientConn, singleProbeTimeout time.Duration) error
+	ProbeForever(ctx context.Context, conn *grpc.ClientConn, singleProbeTimeout time.Duration) error
 }
 
 type Builder interface {

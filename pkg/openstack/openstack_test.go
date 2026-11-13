@@ -19,18 +19,15 @@ package openstack
 import (
 	"context"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"reflect"
-	"regexp"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/gophercloud/gophercloud"
-	"github.com/gophercloud/gophercloud/openstack/compute/v2/extensions/attachinterfaces"
-	"github.com/gophercloud/gophercloud/openstack/compute/v2/servers"
+	"github.com/gophercloud/gophercloud/v2/openstack/compute/v2/servers"
+	neutronports "github.com/gophercloud/gophercloud/v2/openstack/networking/v2/ports"
 	"github.com/spf13/pflag"
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -40,14 +37,6 @@ import (
 
 const (
 	testClusterName = "testCluster"
-
-	// volumeStatus* is configuration of exponential backoff for
-	// waiting for specified volume status. Starting with 1
-	// seconds, multiplying by 1.2 with each step and taking 13 steps at maximum
-	// it will time out after 32s, which roughly corresponds to 30s
-	volumeStatusInitDelay = 1 * time.Second
-	volumeStatusFactor    = 1.2
-	volumeStatusSteps     = 13
 )
 
 // ConfigFromEnv allows setting up credentials etc using the
@@ -82,9 +71,6 @@ func ConfigFromEnv() Config {
 	cfg.Global.ApplicationCredentialSecret = os.Getenv("OS_APPLICATION_CREDENTIAL_SECRET")
 
 	// Set default values for config params
-	cfg.BlockStorage.BSVersion = "auto"
-	cfg.BlockStorage.TrustDevicePath = false
-	cfg.BlockStorage.IgnoreVolumeAZ = false
 	cfg.Metadata.SearchOrder = fmt.Sprintf("%s,%s", metadata.ConfigDriveID, metadata.MetadataID)
 	cfg.Networking.IPv6SupportDisabled = false
 	cfg.Networking.PublicNetworkName = []string{"public"}
@@ -96,7 +82,7 @@ func ConfigFromEnv() Config {
 func TestReadConfig(t *testing.T) {
 	_, err := ReadConfig(nil)
 	if err == nil {
-		t.Errorf("Should fail when no config is provided: %s", err)
+		t.Errorf("Should fail when no config is provided: %v", err)
 	}
 
 	cfg, err := ReadConfig(strings.NewReader(`
@@ -111,16 +97,13 @@ func TestReadConfig(t *testing.T) {
  create-monitor = yes
  monitor-delay = 1m
  monitor-timeout = 30s
- monitor-max-retries = 3
- [BlockStorage]
- bs-version = auto
- trust-device-path = yes
- ignore-volume-az = yes
+ monitor-max-retries = 1
+ monitor-max-retries-down = 3
  [Metadata]
  search-order = configDrive, metadataService
  `))
 	if err != nil {
-		t.Fatalf("Should succeed when a valid config is provided: %s", err)
+		t.Fatalf("Should succeed when a valid config is provided: %v", err)
 	}
 	if cfg.Global.AuthURL != "http://auth.url" {
 		t.Errorf("incorrect authurl: %s", cfg.Global.AuthURL)
@@ -148,25 +131,19 @@ func TestReadConfig(t *testing.T) {
 	}
 
 	if !cfg.LoadBalancer.CreateMonitor {
-		t.Errorf("incorrect lb.createmonitor: %t", cfg.LoadBalancer.CreateMonitor)
+		t.Errorf("incorrect lb.create-monitor: %t", cfg.LoadBalancer.CreateMonitor)
 	}
 	if cfg.LoadBalancer.MonitorDelay.Duration != 1*time.Minute {
-		t.Errorf("incorrect lb.monitordelay: %s", cfg.LoadBalancer.MonitorDelay)
+		t.Errorf("incorrect lb.monitor-delay: %s", cfg.LoadBalancer.MonitorDelay)
 	}
 	if cfg.LoadBalancer.MonitorTimeout.Duration != 30*time.Second {
-		t.Errorf("incorrect lb.monitortimeout: %s", cfg.LoadBalancer.MonitorTimeout)
+		t.Errorf("incorrect lb.monitor-timeout: %s", cfg.LoadBalancer.MonitorTimeout)
 	}
-	if cfg.LoadBalancer.MonitorMaxRetries != 3 {
-		t.Errorf("incorrect lb.monitormaxretries: %d", cfg.LoadBalancer.MonitorMaxRetries)
+	if cfg.LoadBalancer.MonitorMaxRetries != 1 {
+		t.Errorf("incorrect lb.monitor-max-retries: %d", cfg.LoadBalancer.MonitorMaxRetries)
 	}
-	if cfg.BlockStorage.TrustDevicePath != true {
-		t.Errorf("incorrect bs.trustdevicepath: %v", cfg.BlockStorage.TrustDevicePath)
-	}
-	if cfg.BlockStorage.BSVersion != "auto" {
-		t.Errorf("incorrect bs.bs-version: %v", cfg.BlockStorage.BSVersion)
-	}
-	if cfg.BlockStorage.IgnoreVolumeAZ != true {
-		t.Errorf("incorrect bs.IgnoreVolumeAZ: %v", cfg.BlockStorage.IgnoreVolumeAZ)
+	if cfg.LoadBalancer.MonitorMaxRetriesDown != 3 {
+		t.Errorf("incorrect lb.monitor-max-retries-down: %d", cfg.LoadBalancer.MonitorMaxRetriesDown)
 	}
 	if cfg.Metadata.SearchOrder != "configDrive, metadataService" {
 		t.Errorf("incorrect md.search-order: %v", cfg.Metadata.SearchOrder)
@@ -196,7 +173,7 @@ clouds:
     identity_api_version: 3
 `
 	data := []byte(cloud)
-	err = ioutil.WriteFile(cloudFile, data, 0644)
+	err = os.WriteFile(cloudFile, data, 0644)
 	if err != nil {
 		t.Error(err)
 	}
@@ -213,17 +190,14 @@ clouds:
  create-monitor = yes
  monitor-delay = 1m
  monitor-timeout = 30s
- monitor-max-retries = 3
- [BlockStorage]
- bs-version = auto
- trust-device-path = yes
- ignore-volume-az = yes
+ monitor-max-retries = 1
+ monitor-max-retries-down = 3
  [Metadata]
  search-order = configDrive, metadataService
 `))
 
 	if err != nil {
-		t.Fatalf("Should succeed when a valid config is provided: %s", err)
+		t.Fatalf("Should succeed when a valid config is provided: %v", err)
 	}
 
 	// config has priority
@@ -256,14 +230,16 @@ clouds:
 	}
 
 	// Make non-global sections dont get overwritten
-	if cfg.BlockStorage.TrustDevicePath != true {
-		t.Errorf("incorrect bs.trustdevicepath: %v", cfg.BlockStorage.TrustDevicePath)
-	}
-	if cfg.BlockStorage.BSVersion != "auto" {
-		t.Errorf("incorrect bs.bs-version: %v", cfg.BlockStorage.BSVersion)
-	}
 	if !cfg.LoadBalancer.CreateMonitor {
-		t.Errorf("incorrect lb.createmonitor: %t", cfg.LoadBalancer.CreateMonitor)
+		t.Errorf("incorrect lb.create-monitor: %t", cfg.LoadBalancer.CreateMonitor)
+	}
+
+	if cfg.LoadBalancer.MonitorMaxRetries != 1 {
+		t.Errorf("incorrect lb.monitor-max-retries: %d", cfg.LoadBalancer.MonitorMaxRetries)
+	}
+
+	if cfg.LoadBalancer.MonitorMaxRetriesDown != 3 {
+		t.Errorf("incorrect lb.monitor-max-retries-down: %d", cfg.LoadBalancer.MonitorMaxRetriesDown)
 	}
 }
 
@@ -396,10 +372,10 @@ func TestNodeAddresses(t *testing.T) {
 		PublicNetworkName: []string{"public"},
 	}
 
-	interfaces := []attachinterfaces.Interface{
-		{
-			PortState: "ACTIVE",
-			FixedIPs: []attachinterfaces.FixedIP{
+	ports := []PortWithTrunkDetails{{
+		Port: neutronports.Port{
+			Status: "ACTIVE",
+			FixedIPs: []neutronports.IP{
 				{
 					IPAddress: "10.0.0.32",
 				},
@@ -408,9 +384,10 @@ func TestNodeAddresses(t *testing.T) {
 				},
 			},
 		},
+	},
 	}
 
-	addrs, err := nodeAddresses(&srv, interfaces, networkingOpts)
+	addrs, err := nodeAddresses(context.TODO(), &srv, ports, nil, networkingOpts)
 	if err != nil {
 		t.Fatalf("nodeAddresses returned error: %v", err)
 	}
@@ -475,10 +452,10 @@ func TestNodeAddressesCustomPublicNetwork(t *testing.T) {
 		PublicNetworkName: []string{"pub-net"},
 	}
 
-	interfaces := []attachinterfaces.Interface{
-		{
-			PortState: "ACTIVE",
-			FixedIPs: []attachinterfaces.FixedIP{
+	ports := []PortWithTrunkDetails{{
+		Port: neutronports.Port{
+			Status: "ACTIVE",
+			FixedIPs: []neutronports.IP{
 				{
 					IPAddress: "10.0.0.32",
 				},
@@ -487,9 +464,10 @@ func TestNodeAddressesCustomPublicNetwork(t *testing.T) {
 				},
 			},
 		},
+	},
 	}
 
-	addrs, err := nodeAddresses(&srv, interfaces, networkingOpts)
+	addrs, err := nodeAddresses(context.TODO(), &srv, ports, nil, networkingOpts)
 	if err != nil {
 		t.Fatalf("nodeAddresses returned error: %v", err)
 	}
@@ -548,10 +526,10 @@ func TestNodeAddressesCustomPublicNetworkWithIntersectingFixedIP(t *testing.T) {
 		PublicNetworkName: []string{"pub-net"},
 	}
 
-	interfaces := []attachinterfaces.Interface{
-		{
-			PortState: "ACTIVE",
-			FixedIPs: []attachinterfaces.FixedIP{
+	ports := []PortWithTrunkDetails{{
+		Port: neutronports.Port{
+			Status: "ACTIVE",
+			FixedIPs: []neutronports.IP{
 				{
 					IPAddress: "10.0.0.32",
 				},
@@ -564,9 +542,10 @@ func TestNodeAddressesCustomPublicNetworkWithIntersectingFixedIP(t *testing.T) {
 				},
 			},
 		},
+	},
 	}
 
-	addrs, err := nodeAddresses(&srv, interfaces, networkingOpts)
+	addrs, err := nodeAddresses(context.TODO(), &srv, ports, nil, networkingOpts)
 	if err != nil {
 		t.Fatalf("nodeAddresses returned error: %v", err)
 	}
@@ -636,10 +615,10 @@ func TestNodeAddressesMultipleCustomInternalNetworks(t *testing.T) {
 		InternalNetworkName: []string{"private", "also-private"},
 	}
 
-	interfaces := []attachinterfaces.Interface{
-		{
-			PortState: "ACTIVE",
-			FixedIPs: []attachinterfaces.FixedIP{
+	ports := []PortWithTrunkDetails{{
+		Port: neutronports.Port{
+			Status: "ACTIVE",
+			FixedIPs: []neutronports.IP{
 				{
 					IPAddress: "10.0.0.32",
 				},
@@ -648,9 +627,10 @@ func TestNodeAddressesMultipleCustomInternalNetworks(t *testing.T) {
 				},
 			},
 		},
+	},
 	}
 
-	addrs, err := nodeAddresses(&srv, interfaces, networkingOpts)
+	addrs, err := nodeAddresses(context.TODO(), &srv, ports, nil, networkingOpts)
 	if err != nil {
 		t.Fatalf("nodeAddresses returned error: %v", err)
 	}
@@ -720,10 +700,10 @@ func TestNodeAddressesOneInternalNetwork(t *testing.T) {
 		InternalNetworkName: []string{"also-private"},
 	}
 
-	interfaces := []attachinterfaces.Interface{
-		{
-			PortState: "ACTIVE",
-			FixedIPs: []attachinterfaces.FixedIP{
+	ports := []PortWithTrunkDetails{{
+		Port: neutronports.Port{
+			Status: "ACTIVE",
+			FixedIPs: []neutronports.IP{
 				{
 					IPAddress: "10.0.0.32",
 				},
@@ -732,9 +712,10 @@ func TestNodeAddressesOneInternalNetwork(t *testing.T) {
 				},
 			},
 		},
+	},
 	}
 
-	addrs, err := nodeAddresses(&srv, interfaces, networkingOpts)
+	addrs, err := nodeAddresses(context.TODO(), &srv, ports, nil, networkingOpts)
 	if err != nil {
 		t.Fatalf("nodeAddresses returned error: %v", err)
 	}
@@ -796,10 +777,10 @@ func TestNodeAddressesIPv6Disabled(t *testing.T) {
 		IPv6SupportDisabled: true,
 	}
 
-	interfaces := []attachinterfaces.Interface{
-		{
-			PortState: "ACTIVE",
-			FixedIPs: []attachinterfaces.FixedIP{
+	ports := []PortWithTrunkDetails{{
+		Port: neutronports.Port{
+			Status: "ACTIVE",
+			FixedIPs: []neutronports.IP{
 				{
 					IPAddress: "10.0.0.32",
 				},
@@ -808,9 +789,10 @@ func TestNodeAddressesIPv6Disabled(t *testing.T) {
 				},
 			},
 		},
+	},
 	}
 
-	addrs, err := nodeAddresses(&srv, interfaces, networkingOpts)
+	addrs, err := nodeAddresses(context.TODO(), &srv, ports, nil, networkingOpts)
 	if err != nil {
 		t.Fatalf("nodeAddresses returned error: %v", err)
 	}
@@ -830,13 +812,98 @@ func TestNodeAddressesIPv6Disabled(t *testing.T) {
 	}
 }
 
+func TestNodeAddressesWithAddressSortOrderOptions(t *testing.T) {
+	srv := servers.Server{
+		Status:     "ACTIVE",
+		HostID:     "29d3c8c896a45aa4c34e52247875d7fefc3d94bbcc9f622b5d204362",
+		AccessIPv4: "50.56.176.99",
+		AccessIPv6: "2001:4800:790e:510:be76:4eff:fe04:82a8",
+		Addresses: map[string]interface{}{
+			"private": []interface{}{
+				map[string]interface{}{
+					"OS-EXT-IPS-MAC:mac_addr": "fa:16:3e:7c:1b:2b",
+					"version":                 float64(4),
+					"addr":                    "10.0.0.32",
+					"OS-EXT-IPS:type":         "fixed",
+				},
+				map[string]interface{}{
+					"version":         float64(4),
+					"addr":            "50.56.176.36",
+					"OS-EXT-IPS:type": "floating",
+				},
+				map[string]interface{}{
+					"version": float64(4),
+					"addr":    "10.0.0.31",
+					// No OS-EXT-IPS:type
+				},
+			},
+			"public": []interface{}{
+				map[string]interface{}{
+					"version": float64(4),
+					"addr":    "50.56.176.35",
+				},
+				map[string]interface{}{
+					"version": float64(6),
+					"addr":    "2001:4800:780e:510:be76:4eff:fe04:84a8",
+				},
+			},
+		},
+		Metadata: map[string]string{
+			"name":       "a1-yinvcez57-0-bvynoyawrhcg-kube-minion-fg5i4jwcc2yy",
+			TypeHostName: "a1-yinvcez57-0-bvynoyawrhcg-kube-minion-fg5i4jwcc2yy.novalocal",
+		},
+	}
+
+	networkingOpts := NetworkingOpts{
+		PublicNetworkName: []string{"public"},
+		AddressSortOrder:  "10.0.0.0/8, 50.56.176.0/24, 2001:4800::/32",
+	}
+
+	ports := []PortWithTrunkDetails{{
+		Port: neutronports.Port{
+			Status: "ACTIVE",
+			FixedIPs: []neutronports.IP{
+				{
+					IPAddress: "10.0.0.32",
+				},
+				{
+					IPAddress: "10.0.0.31",
+				},
+			},
+		},
+	},
+	}
+
+	addrs, err := nodeAddresses(context.TODO(), &srv, ports, nil, networkingOpts)
+	if err != nil {
+		t.Fatalf("nodeAddresses returned error: %v", err)
+	}
+
+	t.Logf("addresses are %v", addrs)
+
+	want := []v1.NodeAddress{
+		{Type: v1.NodeInternalIP, Address: "10.0.0.31"},
+		{Type: v1.NodeInternalIP, Address: "10.0.0.32"},
+		{Type: v1.NodeExternalIP, Address: "50.56.176.35"},
+		{Type: v1.NodeExternalIP, Address: "50.56.176.36"},
+		{Type: v1.NodeExternalIP, Address: "50.56.176.99"},
+		{Type: v1.NodeExternalIP, Address: "2001:4800:780e:510:be76:4eff:fe04:84a8"},
+		{Type: v1.NodeExternalIP, Address: "2001:4800:790e:510:be76:4eff:fe04:82a8"},
+		{Type: v1.NodeHostName, Address: "a1-yinvcez57-0-bvynoyawrhcg-kube-minion-fg5i4jwcc2yy.novalocal"},
+	}
+
+	if !reflect.DeepEqual(want, addrs) {
+		t.Errorf("nodeAddresses returned incorrect value, want %v", want)
+	}
+}
+
 func TestNewOpenStack(t *testing.T) {
 	cfg := ConfigFromEnv()
 	testConfigFromEnv(t, &cfg)
 
 	_, err := NewOpenStack(cfg)
 	if err != nil {
-		t.Fatalf("Failed to construct/authenticate OpenStack: %s", err)
+		t.Fatalf("Failed to construct/authenticate OpenStack: %v", err)
 	}
 }
 
@@ -852,7 +919,7 @@ func TestLoadBalancer(t *testing.T) {
 
 		os, err := NewOpenStack(cfg)
 		if err != nil {
-			t.Fatalf("Failed to construct/authenticate OpenStack: %s", err)
+			t.Fatalf("Failed to construct/authenticate OpenStack: %v", err)
 		}
 
 		lb, ok := os.LoadBalancer()
@@ -862,7 +929,7 @@ func TestLoadBalancer(t *testing.T) {
 
 		_, exists, err := lb.GetLoadBalancer(context.TODO(), testClusterName, &v1.Service{ObjectMeta: metav1.ObjectMeta{Name: "noexist"}})
 		if err != nil {
-			t.Fatalf("GetLoadBalancer(\"noexist\") returned error: %s", err)
+			t.Fatalf("GetLoadBalancer(\"noexist\") returned error: %v", err)
 		}
 		if exists {
 			t.Fatalf("GetLoadBalancer(\"noexist\") returned exists")
@@ -870,83 +937,54 @@ func TestLoadBalancer(t *testing.T) {
 	}
 }
 
-var FakeMetadata = metadata.Metadata{
-	UUID:             "83679162-1378-4288-a2d4-70e13ec132aa",
-	Name:             "test",
-	AvailabilityZone: "nova",
-}
-
-func TestZones(t *testing.T) {
-	metadata.Set(&FakeMetadata)
-	defer metadata.Clear()
-
-	os := OpenStack{
-		provider: &gophercloud.ProviderClient{
-			IdentityBase: "http://auth.url/",
-		},
-		epOpts: &gophercloud.EndpointOpts{
-			Region:       "myRegion",
-			Availability: gophercloud.AvailabilityPublic,
-		},
-	}
-
-	z, ok := os.Zones()
-	if !ok {
-		t.Fatalf("Zones() returned false")
-	}
-
-	zone, err := z.GetZone(context.TODO())
-	if err != nil {
-		t.Fatalf("GetZone() returned error: %s", err)
-	}
-
-	if zone.Region != "myRegion" {
-		t.Fatalf("GetZone() returned wrong region (%s)", zone.Region)
-	}
-
-	if zone.FailureDomain != "nova" {
-		t.Fatalf("GetZone() returned wrong failure domain (%s)", zone.FailureDomain)
-	}
-}
-
-var diskPathRegexp = regexp.MustCompile("/dev/disk/(?:by-id|by-path)/")
-
 func TestInstanceIDFromProviderID(t *testing.T) {
 	testCases := []struct {
 		providerID string
 		instanceID string
+		region     string
 		fail       bool
 	}{
 		{
 			providerID: ProviderName + "://" + "/" + "7b9cf879-7146-417c-abfd-cb4272f0c935",
 			instanceID: "7b9cf879-7146-417c-abfd-cb4272f0c935",
+			region:     "",
+			fail:       false,
+		},
+		{
+			providerID: ProviderName + "://RegionOne/7b9cf879-7146-417c-abfd-cb4272f0c935",
+			instanceID: "7b9cf879-7146-417c-abfd-cb4272f0c935",
+			region:     "RegionOne",
 			fail:       false,
 		},
 		{
 			// https://github.com/kubernetes/kubernetes/issues/85731
 			providerID: "/7b9cf879-7146-417c-abfd-cb4272f0c935",
 			instanceID: "7b9cf879-7146-417c-abfd-cb4272f0c935",
+			region:     "",
 			fail:       false,
 		},
 		{
 			providerID: "openstack://7b9cf879-7146-417c-abfd-cb4272f0c935",
 			instanceID: "",
+			region:     "",
 			fail:       true,
 		},
 		{
 			providerID: "7b9cf879-7146-417c-abfd-cb4272f0c935",
 			instanceID: "",
+			region:     "",
 			fail:       true,
 		},
 		{
 			providerID: "other-provider:///7b9cf879-7146-417c-abfd-cb4272f0c935",
 			instanceID: "",
+			region:     "",
 			fail:       true,
 		},
 	}
 
 	for _, test := range testCases {
-		instanceID, err := instanceIDFromProviderID(test.providerID)
+		instanceID, instanceRegion, err := instanceIDFromProviderID(test.providerID)
 		if (err != nil) != test.fail {
 			t.Errorf("expected err: %t, got err: %v", test.fail, err)
 		}
@@ -957,6 +995,10 @@ func TestInstanceIDFromProviderID(t *testing.T) {
 
 		if instanceID != test.instanceID {
 			t.Errorf("%s yielded %s. expected %q", test.providerID, instanceID, test.instanceID)
+		}
+
+		if instanceRegion != test.region {
+			t.Errorf("%s yielded region %s. expected %q", test.providerID, instanceRegion, test.region)
 		}
 	}
 }
@@ -1109,27 +1151,6 @@ func TestUserAgentFlag(t *testing.T) {
 				}
 			}
 		})
-	}
-}
-
-func clearEnviron(t *testing.T) []string {
-	env := os.Environ()
-	for _, pair := range env {
-		if strings.HasPrefix(pair, "OS_") {
-			i := strings.Index(pair, "=") + 1
-			os.Unsetenv(pair[:i-1])
-		}
-	}
-	return env
-}
-func resetEnviron(t *testing.T, items []string) {
-	for _, pair := range items {
-		if strings.HasPrefix(pair, "OS_") {
-			i := strings.Index(pair, "=") + 1
-			if err := os.Setenv(pair[:i-1], pair[i:]); err != nil {
-				t.Errorf("Setenv(%q, %q) failed during reset: %v", pair[:i-1], pair[i:], err)
-			}
-		}
 	}
 }
 

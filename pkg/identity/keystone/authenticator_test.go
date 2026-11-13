@@ -14,9 +14,10 @@ limitations under the License.
 package keystone
 
 import (
+	"context"
 	"testing"
 
-	th "github.com/gophercloud/gophercloud/testhelper"
+	th "github.com/gophercloud/gophercloud/v2/testhelper"
 	"k8s.io/apiserver/pkg/authentication/user"
 )
 
@@ -42,7 +43,7 @@ func TestAuthenticateToken(t *testing.T) {
 	a := &Authenticator{
 		keystoner: keystone,
 	}
-	userInfo, allowed, err := a.AuthenticateToken("token")
+	userInfo, allowed, err := a.AuthenticateToken(context.TODO(), "token")
 
 	th.AssertNoErr(t, err)
 	th.AssertEquals(t, true, allowed)

@@ -17,9 +17,12 @@ limitations under the License.
 package cinder
 
 import (
-	"github.com/gophercloud/gophercloud/openstack/blockstorage/v3/snapshots"
-	"github.com/gophercloud/gophercloud/openstack/blockstorage/v3/volumes"
-	"golang.org/x/net/context"
+	"context"
+	"time"
+
+	"github.com/gophercloud/gophercloud/v2/openstack/blockstorage/v3/backups"
+	"github.com/gophercloud/gophercloud/v2/openstack/blockstorage/v3/snapshots"
+	"github.com/gophercloud/gophercloud/v2/openstack/blockstorage/v3/volumes"
 	"k8s.io/cloud-provider-openstack/pkg/util/mount"
 )
 
@@ -32,18 +35,25 @@ var FakeVolName = "CSIVolumeName"
 var FakeVolID = "CSIVolumeID"
 var FakeSnapshotName = "CSISnapshotName"
 var FakeSnapshotID = "261a8b81-3660-43e5-bab8-6470b65ee4e8"
+var FakeBackupID = "67589b87-91e3-4c2f-8fa8-d53eed89ca56"
 var FakeCapacityGiB = 1
 var FakeVolType = ""
 var FakeAvailability = "nova"
 var FakeDevicePath = "/dev/xxx"
 var FakeTargetPath = "/mnt/cinder"
 var FakeStagingTargetPath = "/mnt/globalmount"
+var FakePVName = "fakepv-1"
+var FakePVCName = "fakepvc-1"
+var FakePVCNamespace = "fakepvc-ns"
+var FakeSnapshotContentName = "fake-content"
+var FakeSnapshotNamespace = "fakesnapshot-ns"
 var FakeAttachment = volumes.Attachment{
 	ServerID: FakeNodeID,
 }
 var FakeVol = volumes.Volume{
 	ID:               FakeVolID,
 	Name:             FakeVolName,
+	Status:           "available",
 	Size:             FakeCapacityGiB,
 	AvailabilityZone: FakeAvailability,
 }
@@ -89,6 +99,18 @@ var FakeSnapshotRes = snapshots.Snapshot{
 	Name:     "fake-snapshot",
 	VolumeID: FakeVolID,
 	Size:     1,
+	Status:   "available",
+}
+
+var FakeBackupRes = backups.Backup{
+	ID:         FakeBackupID,
+	Name:       "fake-backup",
+	VolumeID:   FakeVolID,
+	SnapshotID: FakeSnapshotID,
+	CreatedAt:  time.Now(),
+
+	Size:   1,
+	Status: "available",
 }
 
 var FakeSnapshotsRes = []snapshots.Snapshot{FakeSnapshotRes}
@@ -97,8 +119,11 @@ var FakeVolListMultiple = []volumes.Volume{FakeVol1, FakeVol3}
 var FakeVolList = []volumes.Volume{FakeVol1}
 var FakeVolListEmpty = []volumes.Volume{}
 var FakeSnapshotListEmpty = []snapshots.Snapshot{}
+var FakeBackupListEmpty = []backups.Backup{}
 
 var FakeInstanceID = "321a8b81-3660-43e5-bab8-6470b65ee4e8"
+
+var FakeAttachmentID = "fake-attachment-id"
 
 const FakeMaxVolume int64 = 256
 

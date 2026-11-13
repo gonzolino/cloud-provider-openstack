@@ -17,22 +17,25 @@ limitations under the License.
 package healthcheck
 
 import (
+	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"fmt"
-	"io/ioutil"
 	"net/http"
+	"os"
+	"slices"
 	"strings"
 	"time"
 
 	"github.com/mitchellh/mapstructure"
+	"k8s.io/client-go/util/cert"
 	log "k8s.io/klog/v2"
-
-	"k8s.io/cloud-provider-openstack/pkg/autohealing/utils"
 )
 
 const (
 	EndpointType = "Endpoint"
 	TokenPath    = "/var/run/secrets/kubernetes.io/serviceaccount/token"
+	CAPath       = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
 	TimeLayout   = "2006-01-02 15:04:05"
 )
 
@@ -60,6 +63,13 @@ type EndpointCheck struct {
 
 	// (Optional) Token to use in the request header. Default: read from TokenPath file
 	Token string `mapstructure:"token"`
+
+	// (Optional) Path to a CA certificate file used to verify the node's TLS certificate. Only used when Protocol is HTTPS.
+	// Default: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+	CAFile string `mapstructure:"ca-file"`
+
+	// (Optional) If true, skip TLS certificate verification. Default: false
+	TLSInsecure bool `mapstructure:"tls-insecure"`
 }
 
 // GetName returns name of the health check
@@ -78,12 +88,12 @@ func (check *EndpointCheck) IsWorkerSupported() bool {
 }
 
 // checkDuration checks if the node should be marked as healthy or not.
-func (check *EndpointCheck) checkDuration(node NodeInfo, controller NodeController, checkRet bool) bool {
+func (check *EndpointCheck) checkDuration(ctx context.Context, node NodeInfo, controller NodeController, checkRet bool) bool {
 	name := node.KubeNode.Name
 
 	if checkRet {
 		// Remove the annotation
-		if err := controller.UpdateNodeAnnotation(node, check.UnhealthyAnnotation, ""); err != nil {
+		if err := controller.UpdateNodeAnnotation(ctx, node, check.UnhealthyAnnotation, ""); err != nil {
 			log.Errorf("Failed to remove the node annotation(will skip the check) for %s, error: %v", name, err)
 		}
 		return true
@@ -106,7 +116,7 @@ func (check *EndpointCheck) checkDuration(node NodeInfo, controller NodeControll
 
 	if unhealthyStartTime == nil {
 		// Set the annotation value
-		if err := controller.UpdateNodeAnnotation(node, check.UnhealthyAnnotation, now.Format(TimeLayout)); err != nil {
+		if err := controller.UpdateNodeAnnotation(ctx, node, check.UnhealthyAnnotation, now.Format(TimeLayout)); err != nil {
 			log.Errorf("Failed to set the node annotation(will skip the check) for %s, error: %v", name, err)
 		}
 		return true
@@ -121,7 +131,7 @@ func (check *EndpointCheck) checkDuration(node NodeInfo, controller NodeControll
 }
 
 // Check checks the node health, returns false if the node is unhealthy. Update the node cache accordingly.
-func (check *EndpointCheck) Check(node NodeInfo, controller NodeController) bool {
+func (check *EndpointCheck) Check(ctx context.Context, node NodeInfo, controller NodeController) bool {
 	nodeName := node.KubeNode.Name
 	ip := ""
 	for _, addr := range node.KubeNode.Status.Addresses {
@@ -138,12 +148,22 @@ func (check *EndpointCheck) Check(node NodeInfo, controller NodeController) bool
 
 	var client *http.Client
 	protocol := strings.ToLower(check.Protocol)
-	if protocol == "https" {
-		tr := &http.Transport{
-			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+	switch protocol {
+	case "https":
+		tlsConfig := &tls.Config{InsecureSkipVerify: check.TLSInsecure}
+		if check.CAFile != "" && !check.TLSInsecure {
+			var caPool *x509.CertPool
+			var err error
+			caPool, err = cert.NewPool(check.CAFile)
+			if err != nil {
+				log.Errorf("Node %s, failed to load CA file %s, error: %v", nodeName, check.CAFile, err)
+				return check.checkDuration(ctx, node, controller, false)
+			}
+			tlsConfig.RootCAs = caPool
 		}
+		tr := &http.Transport{TLSClientConfig: tlsConfig}
 		client = &http.Client{Transport: tr, Timeout: time.Second * 5}
-	} else if protocol == "http" {
+	case "http":
 		client = &http.Client{Timeout: time.Second * 5}
 	}
 
@@ -152,12 +172,12 @@ func (check *EndpointCheck) Check(node NodeInfo, controller NodeController) bool
 		req, err := http.NewRequest("GET", url, nil)
 		if err != nil {
 			log.Errorf("Node %s, failed to get request %s, error: %v", nodeName, url, err)
-			return check.checkDuration(node, controller, false)
+			return check.checkDuration(ctx, node, controller, false)
 		}
 
 		if check.RequireToken {
 			if check.Token == "" {
-				b, err := ioutil.ReadFile(TokenPath)
+				b, err := os.ReadFile(TokenPath)
 				if err != nil {
 					log.Warningf("Node %s, failed to get token from %s, skip the check", nodeName, TokenPath)
 					return true
@@ -171,20 +191,20 @@ func (check *EndpointCheck) Check(node NodeInfo, controller NodeController) bool
 		resp, err := client.Do(req)
 		if err != nil {
 			log.Errorf("Node %s, failed to read response for url %s, error: %v", nodeName, url, err)
-			return check.checkDuration(node, controller, false)
+			return check.checkDuration(ctx, node, controller, false)
 		}
 		resp.Body.Close()
 
-		if !utils.ContainsInt(check.OKCodes, resp.StatusCode) {
+		if !slices.Contains(check.OKCodes, resp.StatusCode) {
 			log.V(4).Infof("Node %s, return code for url %s is %d, expected: %d", nodeName, url, resp.StatusCode, check.OKCodes)
-			return check.checkDuration(node, controller, false)
+			return check.checkDuration(ctx, node, controller, false)
 		}
 	}
 
-	return check.checkDuration(node, controller, true)
+	return check.checkDuration(ctx, node, controller, true)
 }
 
-func newEndpointCheck(config interface{}) (HealthCheck, error) {
+func NewEndpointCheck(config interface{}) (HealthCheck, error) {
 	check := EndpointCheck{
 		Protocol:            "https",
 		Port:                6443,
@@ -193,6 +213,7 @@ func newEndpointCheck(config interface{}) (HealthCheck, error) {
 		OKCodes:             []int{200},
 		RequireToken:        false,
 		UnhealthyAnnotation: "autohealing.openstack.org/unhealthy-timestamp",
+		CAFile:              CAPath,
 	}
 
 	decConfig := mapstructure.DecoderConfig{
@@ -209,8 +230,4 @@ func newEndpointCheck(config interface{}) (HealthCheck, error) {
 	}
 
 	return &check, nil
-}
-
-func init() {
-	registerHealthCheck(EndpointType, newEndpointCheck)
 }

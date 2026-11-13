@@ -17,70 +17,45 @@ limitations under the License.
 package main
 
 import (
-	"flag"
-	"fmt"
 	"os"
 	"os/signal"
 
 	"github.com/spf13/cobra"
 	"golang.org/x/sys/unix"
 	"k8s.io/cloud-provider-openstack/pkg/kms/server"
-	"k8s.io/component-base/logs"
+	"k8s.io/cloud-provider-openstack/pkg/version"
+	"k8s.io/component-base/cli"
 	"k8s.io/klog/v2"
 )
 
 var (
-	socketpath  string
-	cloudconfig string
+	socketPath  string
+	cloudConfig string
 )
 
-func init() {
-	flag.Set("logtostderr", "true")
-}
-
 func main() {
-	// Glog requires this otherwise it complains.
-	flag.CommandLine.Parse(nil)
-	// This is a temporary hack to enable proper logging until upstream dependencies
-	// are migrated to fully utilize klog instead of glog.
-	klogFlags := flag.NewFlagSet("klog", flag.ExitOnError)
-	klog.InitFlags(klogFlags)
-
-	// Sync the glog and klog flags.
-	flag.CommandLine.VisitAll(func(f1 *flag.Flag) {
-		f2 := klogFlags.Lookup(f1.Name)
-		if f2 != nil {
-			value := f1.Value.String()
-			f2.Value.Set(value)
-		}
-	})
-
-	logs.InitLogs()
-	defer logs.FlushLogs()
-
 	cmd := &cobra.Command{
 		Use:   "barbican-kms-plugin",
-		Short: "Barbican KMS plugin for kubernetes",
+		Short: "Barbican KMS plugin for Kubernetes",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			sigchan := make(chan os.Signal, 1)
-			signal.Notify(sigchan, unix.SIGTERM, unix.SIGINT)
-			err := server.Run(cloudconfig, socketpath, sigchan)
+			sigChan := make(chan os.Signal, 1)
+			signal.Notify(sigChan, unix.SIGTERM, unix.SIGINT)
+			err := server.Run(cloudConfig, socketPath, sigChan)
 			return err
 		},
+		Version: version.Version,
 	}
 
-	cmd.Flags().AddGoFlagSet(flag.CommandLine)
-
-	cmd.PersistentFlags().StringVar(&socketpath, "socketpath", "", "Barbican KMS Plugin unix socket endpoint")
-	cmd.MarkPersistentFlagRequired("socketpath")
-
-	cmd.PersistentFlags().StringVar(&cloudconfig, "cloud-config", "", "Barbican KMS Plugin cloud config")
-	cmd.MarkPersistentFlagRequired("cloud-config")
-
-	if err := cmd.Execute(); err != nil {
-		fmt.Fprintf(os.Stderr, "%s", err.Error())
-		os.Exit(1)
+	cmd.PersistentFlags().StringVar(&socketPath, "socketpath", "", "Barbican KMS Plugin unix socket endpoint")
+	if err := cmd.MarkPersistentFlagRequired("socketpath"); err != nil {
+		klog.Fatalf("Unable to mark flag socketpath as required: %v", err)
 	}
 
-	os.Exit(0)
+	cmd.PersistentFlags().StringVar(&cloudConfig, "cloud-config", "", "Barbican KMS Plugin cloud config")
+	if err := cmd.MarkPersistentFlagRequired("cloud-config"); err != nil {
+		klog.Fatalf("Unable to mark flag cloud-config as required: %v", err)
+	}
+
+	code := cli.Run(cmd)
+	os.Exit(code)
 }

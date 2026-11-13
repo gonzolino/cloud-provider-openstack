@@ -2,51 +2,43 @@ kind: DaemonSet
 apiVersion: apps/v1
 metadata:
   name: {{ include "openstack-manila-csi.nodeplugin.fullname" . }}
+  namespace: {{ .Release.Namespace }}
   labels:
-    app: {{ include "openstack-manila-csi.name" . }}
-    chart: {{ include "openstack-manila-csi.chart" . }}
-    component: {{ .Values.nodeplugin.name }}
-    release: {{ .Release.Name }}
-    heritage: {{ .Release.Service }}
+    {{- include "openstack-manila-csi.nodeplugin.labels" .  | nindent 4 }}
 spec:
   selector:
     matchLabels:
-      app: {{ include "openstack-manila-csi.name" . }}
-      component: {{ .Values.nodeplugin.name }}
-      release: {{ .Release.Name }}
+      {{- include "openstack-manila-csi.nodeplugin.matchLabels" .  | nindent 6 }}
   template:
     metadata:
       labels:
-        app: {{ include "openstack-manila-csi.name" . }}
-        chart: {{ include "openstack-manila-csi.chart" . }}
-        component: {{ .Values.nodeplugin.name }}
-        release: {{ .Release.Name }}
-        heritage: {{ .Release.Service }}
+        {{- include "openstack-manila-csi.nodeplugin.labels" .  | nindent 8 }}
     spec:
+      securityContext: {{ toYaml .Values.nodeplugin.podSecurityContext | nindent 8 }}
       serviceAccountName: {{ include "openstack-manila-csi.serviceAccountName.nodeplugin" . }}
+      # Host network access is usually necessary if using metadata service,
+      # since not all CNIs support link-local addresses, or if the OpenStack
+      # control plane is on a management network that is not advertised to pods
       hostNetwork: true
       dnsPolicy: ClusterFirstWithHostNet
       containers:
         {{- range .Values.shareProtocols }}
         - name: {{ .protocolSelector | lower }}-registrar
+          securityContext:
+            {{- toYaml $.Values.nodeplugin.securityContext | nindent 12 }}
           image: "{{ $.Values.nodeplugin.registrar.image.repository }}:{{ $.Values.nodeplugin.registrar.image.tag }}"
           args:
-            - "--v=5"
+            - "-v={{ $.Values.logVerbosityLevel }}"
             - "--csi-address=/csi/csi.sock"
             - "--kubelet-registration-path=/var/lib/kubelet/plugins/{{ printf "%s.%s" .protocolSelector $.Values.driverName | lower }}/csi.sock"
-          lifecycle:
-            preStop:
-              exec:
-                  command: [
-                    "/bin/sh", "-c",
-                    'rm -rf /registration/{{ printf "%s.%s" .protocolSelector $.Values.driverName | lower }}
-                  /registration/{{ printf "%s.%s" .protocolSelector $.Values.driverName | lower }}-reg.sock'
-                  ]
           env:
             - name: KUBE_NODE_NAME
               valueFrom:
                 fieldRef:
                   fieldPath: spec.nodeName
+            {{- if $.Values.nodeplugin.registrar.extraEnv }}
+              {{- toYaml $.Values.nodeplugin.registrar.extraEnv | nindent 12 }}
+            {{- end }}
           imagePullPolicy: {{ $.Values.nodeplugin.registrar.image.pullPolicy }}
           volumeMounts:
             - name: {{ .protocolSelector | lower }}-plugin-dir
@@ -58,39 +50,42 @@ spec:
         - name: {{ .protocolSelector | lower }}-nodeplugin
           securityContext:
             privileged: true
-            capabilities:
-              add: ["SYS_ADMIN"]
             allowPrivilegeEscalation: true
           image: "{{ $.Values.csimanila.image.repository }}:{{ $.Values.csimanila.image.tag | default $.Chart.AppVersion }}"
           command: ["/bin/sh", "-c",
             '/bin/manila-csi-plugin
-            --v=5
-            --nodeid=$(NODE_ID)
+            -v={{ $.Values.logVerbosityLevel }}
             {{- if $.Values.csimanila.runtimeConfig.enabled }}
             --runtime-config-file=/runtimeconfig/runtimeconfig.json
             {{- end }}
             {{- if $.Values.csimanila.topologyAwarenessEnabled }}
             --with-topology
-            --nodeaz={{ $.Values.csimanila.nodeAZ }}
             {{- end }}
             --endpoint=$(CSI_ENDPOINT)
             --drivername=$(DRIVER_NAME)
             --share-protocol-selector=$(MANILA_SHARE_PROTO)
-            --fwdendpoint=$(FWD_CSI_ENDPOINT)'
+            --fwdendpoint=$(FWD_CSI_ENDPOINT)
+            --cluster-id=$(CLUSTER_NAME)
+            {{- if $.Values.csimanila.searchOrder }}
+            --search-order="{{ $.Values.csimanila.searchOrder }}"
+            {{- end }}'
           ]
           env:
             - name: DRIVER_NAME
               value: {{ printf "%s.%s" .protocolSelector $.Values.driverName | lower }}
-            - name: NODE_ID
-              valueFrom:
-                fieldRef:
-                  fieldPath: spec.nodeName
             - name: CSI_ENDPOINT
               value: "unix:///var/lib/kubelet/plugins/{{ printf "%s.%s" .protocolSelector $.Values.driverName | lower }}/csi.sock"
             - name: FWD_CSI_ENDPOINT
               value: "unix://{{ .fwdNodePluginEndpoint.dir }}/{{ .fwdNodePluginEndpoint.sockFile }}"
             - name: MANILA_SHARE_PROTO
               value: "{{ .protocolSelector }}"
+            {{- if $.Values.csimanila.clusterID }}
+            - name: CLUSTER_NAME
+              value: "{{ $.Values.csimanila.clusterID }}"
+            {{- end }}
+            {{- if $.Values.nodeplugin.nodeplugin.extraEnv }}
+              {{- toYaml $.Values.nodeplugin.nodeplugin.extraEnv | nindent 12 }}
+            {{- end }}
           imagePullPolicy: {{ $.Values.csimanila.image.pullPolicy }}
           volumeMounts:
             - name: {{ .protocolSelector | lower }}-plugin-dir
@@ -101,6 +96,12 @@ spec:
             - name: {{ .protocolSelector | lower }}-runtime-config-dir
               mountPath: /runtimeconfig
               readOnly: true
+            {{- end }}
+            - name: configdrive-dev
+              mountPath: /dev
+              mountPropagation: "HostToContainer"
+            {{- with $.Values.nodeplugin.volumeMounts }}
+            {{- toYaml . | nindent 12 }}
             {{- end }}
           resources:
 {{ toYaml $.Values.nodeplugin.nodeplugin.resources | indent 12 }}
@@ -125,6 +126,13 @@ spec:
             name: manila-csi-runtimeconf-cm
         {{- end }}
         {{- end }}
+        - name: configdrive-dev
+          hostPath:
+            path: /dev
+            type: Directory
+        {{- with .Values.nodeplugin.volumes }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
     {{- if .Values.nodeplugin.affinity }}
       affinity: {{ toYaml .Values.nodeplugin.affinity | nindent 8 }}
     {{- end }}
@@ -134,6 +142,14 @@ spec:
     {{- if .Values.nodeplugin.tolerations }}
       tolerations: {{ toYaml .Values.nodeplugin.tolerations | nindent 8 }}
     {{- end }}
+    {{- with .Values.nodeplugin.hostAliases }}
+      hostAliases:
+        {{- toYaml . | nindent 8 }}
+    {{- end }}
     {{- if .Values.nodeplugin.priorityClassName }}
       priorityClassName: {{ .Values.nodeplugin.priorityClassName }}
+    {{- end }}
+    {{- if .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml .Values.imagePullSecrets | nindent 8 }}
     {{- end }}

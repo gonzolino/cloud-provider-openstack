@@ -24,23 +24,33 @@ type ControllerVolumeContext struct {
 	Protocol            string `name:"protocol" matches:"^(?i)CEPHFS|NFS$"`
 	Type                string `name:"type" value:"default:default"`
 	ShareNetworkID      string `name:"shareNetworkID" value:"optional"`
+	AutoTopology        string `name:"autoTopology" value:"default:false" matches:"(?i)^true|false$"`
 	AvailabilityZone    string `name:"availability" value:"optional"`
 	AppendShareMetadata string `name:"appendShareMetadata" value:"optional"`
+	Affinity            string `name:"affinity" value:"optional"`
+	AntiAffinity        string `name:"antiAffinity" value:"optional"`
+	GroupID             string `name:"groupID" value:"optional"`
 
 	// Adapter options
 
-	CephfsMounter  string `name:"cephfs-mounter" value:"default:fuse" matches:"^kernel|fuse$"`
-	NFSShareClient string `name:"nfs-shareClient" value:"default:0.0.0.0/0"`
+	CephfsMounter            string `name:"cephfs-mounter" value:"default:fuse" matches:"^kernel|fuse$"`
+	CephfsClientID           string `name:"cephfs-clientID" value:"optional"`
+	CephfsKernelMountOptions string `name:"cephfs-kernelMountOptions" value:"optional"`
+	CephfsFuseMountOptions   string `name:"cephfs-fuseMountOptions" value:"optional"`
+	NFSShareClient           string `name:"nfs-shareClient" value:"default:0.0.0.0/0"`
 }
 
 type NodeVolumeContext struct {
-	ShareID       string `name:"shareID" value:"optionalIf:shareName=." precludes:"shareName"`
-	ShareName     string `name:"shareName" value:"optionalIf:shareID=." precludes:"shareID"`
-	ShareAccessID string `name:"shareAccessID"`
+	ShareID        string `name:"shareID" value:"optionalIf:shareName=." precludes:"shareName"`
+	ShareName      string `name:"shareName" value:"optionalIf:shareID=." precludes:"shareID"`
+	ShareAccessID  string `name:"shareAccessID" value:"optional"`  // Deprecated: use shareAccessIDs
+	ShareAccessIDs string `name:"shareAccessIDs" value:"optional"` // Preferred; takes precedence over shareAccessID
 
 	// Adapter options
 
-	CephfsMounter string `name:"cephfs-mounter" value:"default:fuse" matches:"^kernel|fuse$"`
+	CephfsMounter            string `name:"cephfs-mounter" value:"default:fuse" matches:"^kernel|fuse$"`
+	CephfsKernelMountOptions string `name:"cephfs-kernelMountOptions" value:"optional"`
+	CephfsFuseMountOptions   string `name:"cephfs-fuseMountOptions" value:"optional"`
 }
 
 var (
@@ -64,4 +74,8 @@ func NewNodeVolumeContext(data map[string]string) (*NodeVolumeContext, error) {
 	}
 
 	return opts, nil
+}
+
+func NodeVolumeContextFields() []string {
+	return nodeVolumeCtxValidator.Fields
 }

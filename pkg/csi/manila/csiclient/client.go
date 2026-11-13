@@ -18,10 +18,11 @@ package csiclient
 
 import (
 	"context"
-	"github.com/container-storage-interface/spec/lib/go/csi"
-	"github.com/kubernetes-csi/csi-lib-utils/connection"
-	"google.golang.org/grpc"
 	"time"
+
+	"github.com/container-storage-interface/spec/lib/go/csi"
+	"github.com/kubernetes-csi/csi-lib-utils/rpc"
+	"google.golang.org/grpc"
 )
 
 var (
@@ -35,6 +36,10 @@ type NodeSvcClient struct {
 
 func (c *NodeSvcClient) GetCapabilities(ctx context.Context) (*csi.NodeGetCapabilitiesResponse, error) {
 	return c.cl.NodeGetCapabilities(ctx, &csi.NodeGetCapabilitiesRequest{})
+}
+
+func (c *NodeSvcClient) GetVolumeStats(ctx context.Context, req *csi.NodeGetVolumeStatsRequest) (*csi.NodeGetVolumeStatsResponse, error) {
+	return c.cl.NodeGetVolumeStats(ctx, req)
 }
 
 func (c *NodeSvcClient) StageVolume(ctx context.Context, req *csi.NodeStageVolumeRequest) (*csi.NodeStageVolumeResponse, error) {
@@ -61,8 +66,8 @@ func (c IdentitySvcClient) Probe(ctx context.Context, req *csi.ProbeRequest) (*c
 	return c.cl.Probe(ctx, req)
 }
 
-func (c IdentitySvcClient) ProbeForever(conn *grpc.ClientConn, singleProbeTimeout time.Duration) error {
-	return connection.ProbeForever(conn, singleProbeTimeout)
+func (c IdentitySvcClient) ProbeForever(ctx context.Context, conn *grpc.ClientConn, singleProbeTimeout time.Duration) error {
+	return rpc.ProbeForever(ctx, conn, singleProbeTimeout)
 }
 
 func (c IdentitySvcClient) GetPluginInfo(ctx context.Context) (*csi.GetPluginInfoResponse, error) {

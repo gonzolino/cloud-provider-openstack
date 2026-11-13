@@ -17,39 +17,59 @@ limitations under the License.
 package cinder
 
 import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
 	"testing"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
+	"github.com/gophercloud/gophercloud/v2/openstack/blockstorage/v3/backups"
+	"github.com/gophercloud/gophercloud/v2/openstack/blockstorage/v3/volumes"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
+	sharedcsi "k8s.io/cloud-provider-openstack/pkg/csi"
 	"k8s.io/cloud-provider-openstack/pkg/csi/cinder/openstack"
+	cpoerrors "k8s.io/cloud-provider-openstack/pkg/util/errors"
 )
 
-var fakeCs *controllerServer
-var osmock *openstack.OpenStackMock
+func fakeControllerServer() (*controllerServer, *openstack.OpenStackMock) {
+	osmock := new(openstack.OpenStackMock)
 
-// Init Controller Server
-func init() {
-	if fakeCs == nil {
-		osmock = new(openstack.OpenStackMock)
-		openstack.OsInstance = osmock
+	d := NewDriver(&DriverOpts{Endpoint: FakeEndpoint, ClusterID: FakeCluster, WithTopology: true})
 
-		d := NewDriver(FakeNodeID, FakeEndpoint, FakeCluster)
+	cs := NewControllerServer(d, map[string]openstack.IOpenStack{
+		"": osmock,
+	}, nil)
+	return cs, osmock
+}
 
-		fakeCs = NewControllerServer(d, openstack.OsInstance)
-	}
+func fakeControllerServerWithMultipleRegions() (*controllerServer, *openstack.OpenStackMock, *openstack.OpenStackMock) {
+	osmock := new(openstack.OpenStackMock)
+	osmockAlt := new(openstack.OpenStackMock)
+
+	d := NewDriver(&DriverOpts{Endpoint: FakeEndpoint, ClusterID: FakeCluster, WithTopology: true})
+
+	cs := NewControllerServer(d, map[string]openstack.IOpenStack{
+		"":         osmock,
+		"region-x": osmockAlt,
+	}, nil)
+	return cs, osmock, osmockAlt
 }
 
 // Test CreateVolume
 func TestCreateVolume(t *testing.T) {
+	fakeCs, osmock := fakeControllerServer()
 
 	// mock OpenStack
-	properties := map[string]string{"cinder.csi.openstack.org/cluster": FakeCluster}
-	// CreateVolume(name string, size int, vtype, availability string, snapshotID string, tags *map[string]string) (string, string, int, error)
-	osmock.On("CreateVolume", FakeVolName, mock.AnythingOfType("int"), FakeVolType, FakeAvailability, "", "", &properties).Return(&FakeVol, nil)
-
+	properties := map[string]string{cinderCSIClusterIDKey: FakeCluster}
+	osmock.On("CreateVolume", FakeVolName, mock.AnythingOfType("int"), FakeVolType, FakeAvailability, "", "", "", properties).Return(&FakeVol, nil)
 	osmock.On("GetVolumesByName", FakeVolName).Return(FakeVolListEmpty, nil)
-	// Init assert
+	osmock.On("GetBlockStorageOpts").Return(openstack.BlockStorageOpts{})
+
 	assert := assert.New(t)
 
 	// Fake request
@@ -66,7 +86,7 @@ func TestCreateVolume(t *testing.T) {
 		AccessibilityRequirements: &csi.TopologyRequirement{
 			Requisite: []*csi.Topology{
 				{
-					Segments: map[string]string{"topology.cinder.csi.openstack.org/zone": FakeAvailability},
+					Segments: map[string]string{topologyKey: FakeAvailability},
 				},
 			},
 		},
@@ -84,17 +104,417 @@ func TestCreateVolume(t *testing.T) {
 	assert.NotEqual(0, len(actualRes.Volume.VolumeId), "Volume Id is nil")
 	assert.NotNil(actualRes.Volume.AccessibleTopology)
 	assert.Equal(FakeAvailability, actualRes.Volume.AccessibleTopology[0].GetSegments()[topologyKey])
+}
 
+// Test CreateVolume fails with quota exceeded error
+func TestCreateVolumeQuotaError(t *testing.T) {
+	fakeCs, osmock := fakeControllerServer()
+
+	errorVolume := "errorVolume"
+
+	// mock OpenStack
+	properties := map[string]string{cinderCSIClusterIDKey: FakeCluster}
+	osmock.On("CreateVolume", errorVolume, mock.AnythingOfType("int"), FakeVolType, FakeAvailability, "", "", "", properties).Return(&volumes.Volume{}, cpoerrors.ErrQuotaExceeded)
+	osmock.On("GetVolumesByName", errorVolume).Return(FakeVolListEmpty, nil)
+	osmock.On("GetBlockStorageOpts").Return(openstack.BlockStorageOpts{})
+
+	assert := assert.New(t)
+
+	// Fake request
+	fakeReq := &csi.CreateVolumeRequest{
+		Name: errorVolume,
+		VolumeCapabilities: []*csi.VolumeCapability{
+			{
+				AccessMode: &csi.VolumeCapability_AccessMode{
+					Mode: csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER,
+				},
+			},
+		},
+
+		AccessibilityRequirements: &csi.TopologyRequirement{
+			Requisite: []*csi.Topology{
+				{
+					Segments: map[string]string{topologyKey: FakeAvailability},
+				},
+			},
+		},
+	}
+
+	// Invoke CreateVolume
+	_, err := fakeCs.CreateVolume(FakeCtx, fakeReq)
+	if err == nil {
+		t.Errorf("CreateVolume did not return an error")
+	}
+	statusErr, ok := status.FromError(err)
+	if !ok {
+		t.Errorf("CreateVolume did not return a grpc status as error, got %v", err)
+	}
+
+	// Assert
+	assert.Equal(statusErr.Code(), codes.ResourceExhausted)
+}
+
+// Test CreateVolume with additional param
+func TestCreateVolumeWithParam(t *testing.T) {
+	fakeCs, osmock := fakeControllerServer()
+
+	// mock OpenStack
+	properties := map[string]string{cinderCSIClusterIDKey: FakeCluster}
+	osmock.On("CreateVolume", FakeVolName, mock.AnythingOfType("int"), "dummyVolType", "cinder", "", "", "", properties).Return(&FakeVol, nil)
+	osmock.On("GetVolumesByName", FakeVolName).Return(FakeVolListEmpty, nil)
+	osmock.On("GetBlockStorageOpts").Return(openstack.BlockStorageOpts{})
+
+	assert := assert.New(t)
+
+	// Fake request
+	fakeReq := &csi.CreateVolumeRequest{
+		Name: FakeVolName,
+		VolumeCapabilities: []*csi.VolumeCapability{
+			{
+				AccessMode: &csi.VolumeCapability_AccessMode{
+					Mode: csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER,
+				},
+			},
+		},
+
+		Parameters: map[string]string{
+			"availability": "cinder",
+			"type":         "dummyVolType",
+		},
+
+		AccessibilityRequirements: &csi.TopologyRequirement{
+			Requisite: []*csi.Topology{
+				{
+					Segments: map[string]string{topologyKey: FakeAvailability},
+				},
+			},
+		},
+	}
+
+	// Invoke CreateVolume
+	actualRes, err := fakeCs.CreateVolume(FakeCtx, fakeReq)
+	if err != nil {
+		t.Errorf("failed to CreateVolume: %v", err)
+	}
+
+	// Assert
+	assert.NotNil(actualRes.Volume)
+	assert.NotNil(actualRes.Volume.CapacityBytes)
+	assert.NotEqual(0, len(actualRes.Volume.VolumeId), "Volume Id is nil")
+	assert.NotNil(actualRes.Volume.AccessibleTopology)
+	assert.Equal(FakeAvailability, actualRes.Volume.AccessibleTopology[0].GetSegments()[topologyKey])
+}
+
+// Test CreateVolume passes mkfs-options to VolumeContext
+func TestCreateVolumeWithMkfsOptions(t *testing.T) {
+	fakeCs, osmock := fakeControllerServer()
+
+	// mock OpenStack
+	properties := map[string]string{cinderCSIClusterIDKey: FakeCluster}
+	osmock.On("CreateVolume", FakeVolName, mock.AnythingOfType("int"), FakeVolType, FakeAvailability, "", "", "", properties).Return(&FakeVol, nil)
+	osmock.On("GetVolumesByName", FakeVolName).Return(FakeVolListEmpty, nil)
+	osmock.On("GetBlockStorageOpts").Return(openstack.BlockStorageOpts{})
+
+	assert := assert.New(t)
+
+	// Fake request with mkfs-options
+	fakeReq := &csi.CreateVolumeRequest{
+		Name: FakeVolName,
+		VolumeCapabilities: []*csi.VolumeCapability{
+			{
+				AccessMode: &csi.VolumeCapability_AccessMode{
+					Mode: csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER,
+				},
+			},
+		},
+		Parameters: map[string]string{
+			"mkfs-options": "-E nodiscard",
+		},
+		AccessibilityRequirements: &csi.TopologyRequirement{
+			Requisite: []*csi.Topology{
+				{
+					Segments: map[string]string{topologyKey: FakeAvailability},
+				},
+			},
+		},
+	}
+
+	// Invoke CreateVolume
+	actualRes, err := fakeCs.CreateVolume(FakeCtx, fakeReq)
+	if err != nil {
+		t.Errorf("failed to CreateVolume: %v", err)
+	}
+
+	// Assert mkfs-options is in VolumeContext
+	assert.NotNil(actualRes.Volume)
+	assert.Equal("-E nodiscard", actualRes.Volume.VolumeContext["mkfs-options"])
+}
+
+// Test CreateVolume passes mkfs-options on idempotent path (volume already exists)
+func TestCreateVolumeExistingWithMkfsOptions(t *testing.T) {
+	fakeCs, osmock := fakeControllerServer()
+
+	// mock OpenStack - volume already exists
+	osmock.On("GetVolumesByName", FakeVolName).Return(FakeVolList, nil)
+	osmock.On("GetBlockStorageOpts").Return(openstack.BlockStorageOpts{})
+
+	assert := assert.New(t)
+
+	// Fake request with mkfs-options
+	fakeReq := &csi.CreateVolumeRequest{
+		Name: FakeVolName,
+		VolumeCapabilities: []*csi.VolumeCapability{
+			{
+				AccessMode: &csi.VolumeCapability_AccessMode{
+					Mode: csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER,
+				},
+			},
+		},
+		Parameters: map[string]string{
+			"mkfs-options": "-E nodiscard",
+		},
+		AccessibilityRequirements: &csi.TopologyRequirement{
+			Requisite: []*csi.Topology{
+				{
+					Segments: map[string]string{topologyKey: FakeAvailability},
+				},
+			},
+		},
+	}
+
+	// Invoke CreateVolume
+	actualRes, err := fakeCs.CreateVolume(FakeCtx, fakeReq)
+	if err != nil {
+		t.Errorf("failed to CreateVolume: %v", err)
+	}
+
+	// Assert mkfs-options is in VolumeContext even on idempotent path
+	assert.NotNil(actualRes.Volume)
+	assert.Equal("-E nodiscard", actualRes.Volume.VolumeContext["mkfs-options"])
+}
+
+// Test CreateVolume with ignore-volume-az option
+func TestCreateVolumeWithIgnoreVolumeAZ(t *testing.T) {
+	fakeCs, osmock := fakeControllerServer()
+
+	properties := map[string]string{cinderCSIClusterIDKey: FakeCluster}
+	osmock.On("CreateVolume", FakeVolName, mock.AnythingOfType("int"), FakeVolType, "cinder", "", "", "", properties).Return(&FakeVol, nil)
+	osmock.On("GetVolumesByName", FakeVolName).Return(FakeVolListEmpty, nil)
+	osmock.On("GetBlockStorageOpts").Return(openstack.BlockStorageOpts{IgnoreVolumeAZ: true})
+
+	assert := assert.New(t)
+
+	// Fake request
+	fakeReq := &csi.CreateVolumeRequest{
+		Name: FakeVolName,
+		VolumeCapabilities: []*csi.VolumeCapability{
+			{
+				AccessMode: &csi.VolumeCapability_AccessMode{
+					Mode: csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER,
+				},
+			},
+		},
+
+		Parameters: map[string]string{
+			"availability": "cinder",
+		},
+
+		AccessibilityRequirements: &csi.TopologyRequirement{
+			Requisite: []*csi.Topology{
+				{
+					Segments: map[string]string{topologyKey: "bar"},
+				},
+				{
+					Segments: map[string]string{topologyKey: "foo"},
+				},
+			},
+			Preferred: []*csi.Topology{
+				{
+					Segments: map[string]string{topologyKey: "foo"},
+				},
+				{
+					Segments: map[string]string{topologyKey: "bar"},
+				},
+			},
+		},
+	}
+
+	// Invoke CreateVolume
+	actualRes, err := fakeCs.CreateVolume(FakeCtx, fakeReq)
+	if err != nil {
+		t.Errorf("failed to CreateVolume: %v", err)
+	}
+
+	// Assert
+	assert.NotNil(actualRes.Volume)
+	assert.NotNil(actualRes.Volume.CapacityBytes)
+	assert.NotEqual(0, len(actualRes.Volume.VolumeId), "Volume Id is nil")
+	assert.NotNil(actualRes.Volume.AccessibleTopology)
+	assert.Equal("foo", actualRes.Volume.AccessibleTopology[0].GetSegments()[topologyKey])
+}
+
+// Test CreateVolume with --with-topology=false flag
+func TestCreateVolumeWithTopologyDisabled(t *testing.T) {
+	assert := assert.New(t)
+
+	tests := []struct {
+		name             string
+		volumeParams     map[string]string
+		expectedVolumeAZ string
+	}{
+		{
+			name:             "empty paramters",
+			volumeParams:     nil,
+			expectedVolumeAZ: "",
+		},
+		{
+			name: "availability parameter",
+			volumeParams: map[string]string{
+				"availability": "cinder",
+			},
+			expectedVolumeAZ: "cinder",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fakeCs, osmock := fakeControllerServer()
+			fakeCs.Driver.withTopology = false
+
+			properties := map[string]string{cinderCSIClusterIDKey: FakeCluster}
+			osmock.On("CreateVolume", FakeVolName, mock.AnythingOfType("int"), FakeVolType, tt.expectedVolumeAZ, "", "", "", properties).Return(&FakeVol, nil)
+			osmock.On("GetVolumesByName", FakeVolName).Return(FakeVolListEmpty, nil)
+			osmock.On("GetBlockStorageOpts").Return(openstack.BlockStorageOpts{})
+
+			// Fake request
+			fakeReq := &csi.CreateVolumeRequest{
+				Name: FakeVolName,
+				VolumeCapabilities: []*csi.VolumeCapability{
+					{
+						AccessMode: &csi.VolumeCapability_AccessMode{
+							Mode: csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER,
+						},
+					},
+				},
+
+				Parameters: tt.volumeParams,
+
+				AccessibilityRequirements: nil,
+			}
+
+			// Invoke CreateVolume
+			actualRes, err := fakeCs.CreateVolume(FakeCtx, fakeReq)
+			if err != nil {
+				t.Errorf("failed to CreateVolume: %v", err)
+			}
+
+			// Assert
+			assert.NotNil(actualRes.Volume)
+			assert.NotNil(actualRes.Volume.CapacityBytes)
+			assert.NotEqual(0, len(actualRes.Volume.VolumeId), "Volume Id is nil")
+			// This should always be nil if --with-topology=false
+			assert.Nil(actualRes.Volume.AccessibleTopology)
+		})
+	}
+}
+
+func TestCreateVolumeWithExtraMetadata(t *testing.T) {
+	fakeCs, osmock := fakeControllerServer()
+
+	// mock OpenStack
+	properties := map[string]string{
+		cinderCSIClusterIDKey:     FakeCluster,
+		sharedcsi.PvNameKey:       FakePVName,
+		sharedcsi.PvcNameKey:      FakePVCName,
+		sharedcsi.PvcNamespaceKey: FakePVCNamespace,
+	}
+	osmock.On("CreateVolume", FakeVolName, mock.AnythingOfType("int"), FakeVolType, FakeAvailability, "", "", "", properties).Return(&FakeVol, nil)
+	osmock.On("GetVolumesByName", FakeVolName).Return(FakeVolListEmpty, nil)
+	osmock.On("GetBlockStorageOpts").Return(openstack.BlockStorageOpts{})
+
+	// Fake request
+	fakeReq := &csi.CreateVolumeRequest{
+		Name: FakeVolName,
+		Parameters: map[string]string{
+			sharedcsi.PvNameKey:       FakePVName,
+			sharedcsi.PvcNameKey:      FakePVCName,
+			sharedcsi.PvcNamespaceKey: FakePVCNamespace,
+		},
+		VolumeCapabilities: []*csi.VolumeCapability{
+			{
+				AccessMode: &csi.VolumeCapability_AccessMode{
+					Mode: csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER,
+				},
+			},
+		},
+
+		AccessibilityRequirements: &csi.TopologyRequirement{
+			Requisite: []*csi.Topology{
+				{
+					Segments: map[string]string{topologyKey: FakeAvailability},
+				},
+			},
+		},
+	}
+
+	// Invoke CreateVolume
+	_, err := fakeCs.CreateVolume(FakeCtx, fakeReq)
+	if err != nil {
+		t.Errorf("failed to CreateVolume: %v", err)
+	}
+}
+
+func TestCreateVolumeWithAppendVolumeMetadata(t *testing.T) {
+	fakeCs, osmock := fakeControllerServer()
+
+	expectedProperties := map[string]string{
+		cinderCSIClusterIDKey:     "override",
+		sharedcsi.PvNameKey:       FakePVName,
+		sharedcsi.PvcNameKey:      FakePVCName,
+		sharedcsi.PvcNamespaceKey: FakePVCNamespace,
+		"key1":                    "value1",
+		"key2":                    "value2",
+	}
+	osmock.On("CreateVolume", FakeVolName, mock.AnythingOfType("int"), "", "", "", "", "", expectedProperties).Return(&FakeVol, nil)
+	osmock.On("GetVolumesByName", FakeVolName).Return(FakeVolListEmpty, nil)
+	osmock.On("GetBlockStorageOpts").Return(openstack.BlockStorageOpts{})
+
+	fakeReq := &csi.CreateVolumeRequest{
+		Name: FakeVolName,
+		VolumeCapabilities: []*csi.VolumeCapability{
+			{
+				AccessMode: &csi.VolumeCapability_AccessMode{
+					Mode: csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER,
+				},
+			},
+		},
+
+		Parameters: map[string]string{
+			sharedcsi.PvNameKey:       FakePVName,
+			sharedcsi.PvcNameKey:      FakePVCName,
+			sharedcsi.PvcNamespaceKey: FakePVCNamespace,
+			openstack.VolumeAppendVolumeMetadata: `{
+  "key1": "value1",
+  "key2": "value2",
+  "csi.storage.k8s.io/pvc/namespace": "ignored",
+  "cinder.csi.openstack.org/cluster": "override"
+}`,
+		},
+	}
+
+	_, err := fakeCs.CreateVolume(FakeCtx, fakeReq)
+	if err != nil {
+		t.Errorf("failed to CreateVolume: %v", err)
+	}
 }
 
 func TestCreateVolumeFromSnapshot(t *testing.T) {
+	fakeCs, osmock := fakeControllerServer()
 
-	properties := map[string]string{"cinder.csi.openstack.org/cluster": FakeCluster}
-	// CreateVolume(name string, size int, vtype, availability string, snapshotID string, tags *map[string]string) (string, string, int, error)
-	osmock.On("CreateVolume", FakeVolName, mock.AnythingOfType("int"), FakeVolType, "", FakeSnapshotID, "", &properties).Return(&FakeVolFromSnapshot, nil)
+	properties := map[string]string{cinderCSIClusterIDKey: FakeCluster}
+	osmock.On("CreateVolume", FakeVolName, mock.AnythingOfType("int"), FakeVolType, "", FakeSnapshotID, "", "", properties).Return(&FakeVolFromSnapshot, nil)
 	osmock.On("GetVolumesByName", FakeVolName).Return(FakeVolListEmpty, nil)
+	osmock.On("GetBlockStorageOpts").Return(openstack.BlockStorageOpts{})
 
-	// Init assert
 	assert := assert.New(t)
 
 	src := &csi.VolumeContentSource{
@@ -132,17 +552,17 @@ func TestCreateVolumeFromSnapshot(t *testing.T) {
 	assert.NotEqual(0, len(actualRes.Volume.VolumeId), "Volume Id is nil")
 
 	assert.Equal(FakeSnapshotID, actualRes.Volume.ContentSource.GetSnapshot().SnapshotId)
-
 }
 
 func TestCreateVolumeFromSourceVolume(t *testing.T) {
+	fakeCs, osmock := fakeControllerServer()
 
-	properties := map[string]string{"cinder.csi.openstack.org/cluster": FakeCluster}
-	// CreateVolume(name string, size int, vtype, availability string, snapshotID string, tags *map[string]string) (string, string, int, error)
-	osmock.On("CreateVolume", FakeVolName, mock.AnythingOfType("int"), FakeVolType, "", "", FakeVolID, &properties).Return(&FakeVolFromSourceVolume, nil)
+	properties := map[string]string{cinderCSIClusterIDKey: FakeCluster}
+	osmock.On("CreateVolume", FakeVolName, mock.AnythingOfType("int"), FakeVolType, "", "", FakeVolID, "", properties).Return(&FakeVolFromSourceVolume, nil)
 	osmock.On("GetVolumesByName", FakeVolName).Return(FakeVolListEmpty, nil)
+	osmock.On("GetBlockStorageOpts").Return(openstack.BlockStorageOpts{})
+	osmock.On("GetVolume", FakeVolID).Return(&FakeVol, nil)
 
-	// Init assert
 	assert := assert.New(t)
 
 	volsrc := &csi.VolumeContentSource{
@@ -180,16 +600,17 @@ func TestCreateVolumeFromSourceVolume(t *testing.T) {
 	assert.NotEqual(0, len(actualRes.Volume.VolumeId), "Volume Id is nil")
 
 	assert.Equal(FakeVolID, actualRes.Volume.ContentSource.GetVolume().VolumeId)
-
 }
 
-// Test CreateVolumeDuplicate
+// Test CreateVolume when a volume with the given name already exists
 func TestCreateVolumeDuplicate(t *testing.T) {
-
-	// Init assert
-	assert := assert.New(t)
+	fakeCs, osmock := fakeControllerServer()
 
 	osmock.On("GetVolumesByName", "fake-duplicate").Return(FakeVolList, nil)
+	osmock.On("GetBlockStorageOpts").Return(openstack.BlockStorageOpts{})
+	osmock.On("GetVolumesByName", "fake-duplicate").Return(FakeVolList, nil)
+
+	assert := assert.New(t)
 
 	// Fake request
 	fakeReq := &csi.CreateVolumeRequest{
@@ -218,11 +639,10 @@ func TestCreateVolumeDuplicate(t *testing.T) {
 
 // Test DeleteVolume
 func TestDeleteVolume(t *testing.T) {
+	fakeCs, osmock := fakeControllerServer()
 
-	// DeleteVolume(volumeID string) error
 	osmock.On("DeleteVolume", FakeVolID).Return(nil)
 
-	// Init assert
 	assert := assert.New(t)
 
 	// Fake request
@@ -230,7 +650,7 @@ func TestDeleteVolume(t *testing.T) {
 		VolumeId: FakeVolID,
 	}
 
-	// Expected Result
+	// Expected result
 	expectedRes := &csi.DeleteVolumeResponse{}
 
 	// Invoke DeleteVolume
@@ -245,15 +665,13 @@ func TestDeleteVolume(t *testing.T) {
 
 // Test ControllerPublishVolume
 func TestControllerPublishVolume(t *testing.T) {
+	fakeCs, osmock := fakeControllerServer()
 
-	// AttachVolume(instanceID, volumeID string) (string, error)
+	osmock.On("GetVolume", FakeVolID).Return(&FakeVol, nil)
 	osmock.On("AttachVolume", FakeNodeID, FakeVolID).Return(FakeVolID, nil)
-	// WaitDiskAttached(instanceID string, volumeID string) error
 	osmock.On("WaitDiskAttached", FakeNodeID, FakeVolID).Return(nil)
-	// GetAttachmentDiskPath(instanceID, volumeID string) (string, error)
 	osmock.On("GetAttachmentDiskPath", FakeNodeID, FakeVolID).Return(FakeDevicePath, nil)
 
-	// Init assert
 	assert := assert.New(t)
 
 	// Fake request
@@ -268,7 +686,7 @@ func TestControllerPublishVolume(t *testing.T) {
 		Readonly: false,
 	}
 
-	// Expected Result
+	// Expected result
 	expectedRes := &csi.ControllerPublishVolumeResponse{
 		PublishContext: map[string]string{
 			"DevicePath": FakeDevicePath,
@@ -287,13 +705,11 @@ func TestControllerPublishVolume(t *testing.T) {
 
 // Test ControllerUnpublishVolume
 func TestControllerUnpublishVolume(t *testing.T) {
+	fakeCs, osmock := fakeControllerServer()
 
-	// DetachVolume(instanceID, volumeID string) error
 	osmock.On("DetachVolume", FakeNodeID, FakeVolID).Return(nil)
-	// WaitDiskDetached(instanceID string, volumeID string) error
 	osmock.On("WaitDiskDetached", FakeNodeID, FakeVolID).Return(nil)
 
-	// Init assert
 	assert := assert.New(t)
 
 	// Fake request
@@ -302,7 +718,7 @@ func TestControllerUnpublishVolume(t *testing.T) {
 		NodeId:   FakeNodeID,
 	}
 
-	// Expected Result
+	// Expected result
 	expectedRes := &csi.ControllerUnpublishVolumeResponse{}
 
 	// Invoke ControllerUnpublishVolume
@@ -315,35 +731,45 @@ func TestControllerUnpublishVolume(t *testing.T) {
 	assert.Equal(expectedRes, actualRes)
 }
 
+func extractFakeNodeIDs(attachments []volumes.Attachment) []string {
+	nodeIDs := make([]string, len(attachments))
+	for i, attachment := range attachments {
+		nodeIDs[i] = attachment.ServerID
+	}
+	return nodeIDs
+}
+
+func genFakeVolumeEntry(fakeVol volumes.Volume) *csi.ListVolumesResponse_Entry {
+	return &csi.ListVolumesResponse_Entry{
+		Volume: &csi.Volume{
+			VolumeId:      fakeVol.ID,
+			CapacityBytes: int64(fakeVol.Size * 1024 * 1024 * 1024),
+		},
+		Status: &csi.ListVolumesResponse_VolumeStatus{
+			PublishedNodeIds: extractFakeNodeIDs(fakeVol.Attachments),
+		},
+	}
+}
+
+func genFakeVolumeEntries(fakeVolumes []volumes.Volume) []*csi.ListVolumesResponse_Entry {
+	entries := make([]*csi.ListVolumesResponse_Entry, 0, len(fakeVolumes))
+	for _, fakeVol := range fakeVolumes {
+		entries = append(entries, genFakeVolumeEntry(fakeVol))
+	}
+	return entries
+}
+
 func TestListVolumes(t *testing.T) {
+	fakeCs, osmock := fakeControllerServer()
 
 	osmock.On("ListVolumes", 2, FakeVolID).Return(FakeVolListMultiple, "", nil)
 
-	// Init assert
 	assert := assert.New(t)
-
 	fakeReq := &csi.ListVolumesRequest{MaxEntries: 2, StartingToken: FakeVolID}
 
-	// Expected Result
+	// Expected result
 	expectedRes := &csi.ListVolumesResponse{
-		Entries: []*csi.ListVolumesResponse_Entry{
-			{
-				Volume: &csi.Volume{
-					VolumeId:      FakeVol1.ID,
-					CapacityBytes: int64(FakeVol1.Size * 1024 * 1024 * 1024),
-				},
-				Status: &csi.ListVolumesResponse_VolumeStatus{
-					PublishedNodeIds: []string{FakeNodeID},
-				},
-			},
-			{
-				Volume: &csi.Volume{
-					VolumeId:      FakeVol3.ID,
-					CapacityBytes: int64(FakeVol3.Size * 1024 * 1024 * 1024),
-				},
-				Status: &csi.ListVolumesResponse_VolumeStatus{},
-			},
-		},
+		Entries:   genFakeVolumeEntries(FakeVolListMultiple),
 		NextToken: "",
 	}
 
@@ -357,14 +783,349 @@ func TestListVolumes(t *testing.T) {
 	assert.Equal(expectedRes, actualRes)
 }
 
+type ListVolumesTest struct {
+	name          string
+	maxEntries    int
+	startingToken string
+	volumeSet     map[string]ListVolumeTestOSMock
+	result        ListVolumesTestResult
+}
+
+type ListVolumeTestOSMock struct {
+	mockCloud      *openstack.OpenStackMock
+	mockTokenReq   string
+	mockVolumesRes []volumes.Volume
+	mockTokenRes   string
+}
+
+type ListVolumesTestResult struct {
+	ExpectedToken string
+	Entries       []*csi.ListVolumesResponse_Entry
+}
+
+func TestGlobalListVolumesMultipleClouds(t *testing.T) {
+	fakeCs, osmock := fakeControllerServer()
+	fakeCsMulti, osmockMulti, osmockMultiAlt := fakeControllerServerWithMultipleRegions()
+
+	tests := []*ListVolumesTest{
+		{
+			name:       "Single cloud, no volume",
+			maxEntries: 0,
+			volumeSet: map[string]ListVolumeTestOSMock{
+				"": {
+					mockCloud:      osmock,
+					mockVolumesRes: []volumes.Volume{},
+				},
+			},
+			result: ListVolumesTestResult{
+				Entries: genFakeVolumeEntries([]volumes.Volume{}),
+			},
+		},
+		{
+			name:       "Single cloud, with token",
+			maxEntries: 0,
+			volumeSet: map[string]ListVolumeTestOSMock{
+				"": {
+					mockCloud: osmock,
+					mockVolumesRes: []volumes.Volume{
+						{ID: "vol1"},
+						{ID: "vol2"},
+					},
+					mockTokenRes: "vol2",
+				},
+			},
+
+			result: ListVolumesTestResult{
+				ExpectedToken: "vol2",
+				Entries: genFakeVolumeEntries([]volumes.Volume{
+					{ID: "vol1"},
+					{ID: "vol2"},
+				}),
+			},
+		},
+		{
+			name:       "Single cloud, no token",
+			maxEntries: 0,
+			volumeSet: map[string]ListVolumeTestOSMock{
+				"": {
+					mockCloud: osmock,
+					mockVolumesRes: []volumes.Volume{
+						{ID: "vol1"},
+						{ID: "vol2"},
+						{ID: "vol3"},
+						{ID: "vol4"},
+					},
+				},
+			},
+
+			result: ListVolumesTestResult{
+				Entries: genFakeVolumeEntries([]volumes.Volume{
+					{ID: "vol1"},
+					{ID: "vol2"},
+					{ID: "vol3"},
+					{ID: "vol4"},
+				}),
+			},
+		},
+		{
+			name:       "Multiple clouds, no volumes",
+			maxEntries: 0,
+			volumeSet: map[string]ListVolumeTestOSMock{
+				"": {
+					mockCloud:      osmockMulti,
+					mockVolumesRes: []volumes.Volume{},
+				},
+				"region-x": {
+					mockCloud:      osmockMultiAlt,
+					mockVolumesRes: []volumes.Volume{},
+				},
+			},
+			result: ListVolumesTestResult{
+				ExpectedToken: ":region-x",
+				Entries:       genFakeVolumeEntries([]volumes.Volume{}),
+			},
+		},
+		{
+			name:          "Multiple clouds, no volumes, 2nd request",
+			startingToken: ":region-x",
+			maxEntries:    0,
+			volumeSet: map[string]ListVolumeTestOSMock{
+				"": {
+					mockCloud:      osmockMulti,
+					mockVolumesRes: []volumes.Volume{},
+				},
+				"region-x": {
+					mockCloud:      osmockMultiAlt,
+					mockVolumesRes: []volumes.Volume{},
+				},
+			},
+			result: ListVolumesTestResult{
+				Entries: genFakeVolumeEntries([]volumes.Volume{}),
+			},
+		},
+		{
+			name:       "Multiple clouds",
+			maxEntries: 0,
+			volumeSet: map[string]ListVolumeTestOSMock{
+				"": {
+					mockCloud: osmockMulti,
+					mockVolumesRes: []volumes.Volume{
+						{ID: "vol1"},
+						{ID: "vol2"},
+						{ID: "vol3"},
+						{ID: "vol4"},
+					},
+				},
+				"region-x": {
+					mockCloud: osmockMultiAlt,
+					mockVolumesRes: []volumes.Volume{
+						{ID: "vol5"},
+						{ID: "vol6"},
+						{ID: "vol7"},
+					},
+				},
+			},
+			result: ListVolumesTestResult{
+				ExpectedToken: ":region-x",
+				Entries: genFakeVolumeEntries([]volumes.Volume{
+					{ID: "vol1"},
+					{ID: "vol2"},
+					{ID: "vol3"},
+					{ID: "vol4"},
+				}),
+			},
+		},
+		{
+			name:          "Multiple clouds, 2nd request",
+			maxEntries:    0,
+			startingToken: ":region-x",
+			volumeSet: map[string]ListVolumeTestOSMock{
+				"": {
+					mockCloud: osmockMulti,
+					mockVolumesRes: []volumes.Volume{
+						{ID: "vol1"},
+						{ID: "vol2"},
+						{ID: "vol3"},
+						{ID: "vol4"},
+					},
+				},
+				"region-x": {
+					mockCloud: osmockMultiAlt,
+					mockVolumesRes: []volumes.Volume{
+						{ID: "vol5"},
+						{ID: "vol6"},
+						{ID: "vol7"},
+					},
+				},
+			},
+			result: ListVolumesTestResult{
+				Entries: genFakeVolumeEntries([]volumes.Volume{
+					{ID: "vol5"},
+					{ID: "vol6"},
+					{ID: "vol7"},
+				}),
+			},
+		},
+		// PAGINATION
+		{
+			name:       "Pagination, no volumes",
+			maxEntries: 2,
+			volumeSet: map[string]ListVolumeTestOSMock{
+				"": {
+					mockCloud:      osmockMulti,
+					mockVolumesRes: []volumes.Volume{},
+				},
+				"region-x": {
+					mockCloud:      osmockMultiAlt,
+					mockVolumesRes: []volumes.Volume{},
+				},
+			},
+			result: ListVolumesTestResult{
+				ExpectedToken: ":region-x",
+				Entries:       genFakeVolumeEntries([]volumes.Volume{}),
+			},
+		},
+		{
+			name:       "Pagination",
+			maxEntries: 2,
+			volumeSet: map[string]ListVolumeTestOSMock{
+				"": {
+					mockCloud: osmockMulti,
+					mockVolumesRes: []volumes.Volume{
+						{ID: "vol1"},
+						{ID: "vol2"},
+					},
+				},
+				"region-x": {
+					mockCloud: osmockMultiAlt,
+					mockVolumesRes: []volumes.Volume{
+						{ID: "vol3"},
+						{ID: "vol4"},
+						{ID: "vol5"},
+					},
+				},
+			},
+			result: ListVolumesTestResult{
+				ExpectedToken: ":region-x",
+				Entries: genFakeVolumeEntries([]volumes.Volume{
+					{ID: "vol1"},
+					{ID: "vol2"},
+				}),
+			},
+		},
+		{
+			name:          "Pagination, 2nd request",
+			maxEntries:    2,
+			startingToken: ":region-x",
+			volumeSet: map[string]ListVolumeTestOSMock{
+				"": {
+					mockCloud: osmockMulti,
+					mockVolumesRes: []volumes.Volume{
+						{ID: "vol1"},
+						{ID: "vol2"},
+					},
+				},
+				"region-x": {
+					mockCloud: osmockMultiAlt,
+					mockVolumesRes: []volumes.Volume{
+						{ID: "vol3"},
+						{ID: "vol4"},
+					},
+					mockTokenRes: "vol4",
+				},
+			},
+			result: ListVolumesTestResult{
+				ExpectedToken: "vol4:region-x",
+				Entries: genFakeVolumeEntries([]volumes.Volume{
+					{ID: "vol3"},
+					{ID: "vol4"},
+				}),
+			},
+		},
+		{
+			name:          "Pagination, 3rd request",
+			maxEntries:    2,
+			startingToken: "vol4:region-x",
+			volumeSet: map[string]ListVolumeTestOSMock{
+				"": {
+					mockCloud: osmockMulti,
+					mockVolumesRes: []volumes.Volume{
+						{ID: "vol1"},
+						{ID: "vol2"},
+					},
+				},
+				"region-x": {
+					mockCloud:    osmockMultiAlt,
+					mockTokenReq: "vol4",
+					mockVolumesRes: []volumes.Volume{
+						{ID: "vol5"},
+					},
+				},
+			},
+			result: ListVolumesTestResult{
+				Entries: genFakeVolumeEntries([]volumes.Volume{
+					{ID: "vol5"},
+				}),
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			assert := assert.New(t)
+			// Setup Mock
+			for _, volumeSet := range test.volumeSet {
+				cloud := volumeSet.mockCloud
+				cloud.On(
+					"ListVolumes",
+					test.maxEntries,
+					volumeSet.mockTokenReq,
+				).Return(
+					volumeSet.mockVolumesRes,
+					volumeSet.mockTokenRes,
+					nil,
+				).Once()
+				defer cloud.On(
+					"ListVolumes",
+					test.maxEntries,
+					volumeSet.mockTokenReq,
+				).Return(
+					volumeSet.mockVolumesRes,
+					volumeSet.mockTokenRes,
+					nil,
+				).Unset()
+			}
+			var err error
+			fakeReq := &csi.ListVolumesRequest{MaxEntries: int32(test.maxEntries), StartingToken: test.startingToken}
+			expectedRes := &csi.ListVolumesResponse{
+				Entries:   test.result.Entries,
+				NextToken: test.result.ExpectedToken,
+			}
+			// Invoke ListVolumes
+			cs := fakeCs
+			if len(test.volumeSet) > 1 {
+				cs = fakeCsMulti
+			}
+			actualRes, err := cs.ListVolumes(FakeCtx, fakeReq)
+			if err != nil {
+				t.Errorf("failed to ListVolumes: %v", err)
+			}
+			// Assert
+			assert.Equal(expectedRes, actualRes)
+		})
+	}
+}
+
 // Test CreateSnapshot
 func TestCreateSnapshot(t *testing.T) {
+	fakeCs, osmock := fakeControllerServer()
 
-	osmock.On("CreateSnapshot", FakeSnapshotName, FakeVolID, &map[string]string{"tag": "tag1"}).Return(&FakeSnapshotRes, nil)
+	osmock.On("CreateSnapshot", FakeSnapshotName, FakeVolID, map[string]string{cinderCSIClusterIDKey: "cluster"}).Return(&FakeSnapshotRes, nil)
 	osmock.On("ListSnapshots", map[string]string{"Name": FakeSnapshotName}).Return(FakeSnapshotListEmpty, "", nil)
-	osmock.On("WaitSnapshotReady", FakeSnapshotID).Return(nil)
+	osmock.On("WaitSnapshotReady", FakeSnapshotID).Return(FakeSnapshotRes.Status, nil)
+	osmock.On("ListBackups", map[string]string{"Name": FakeSnapshotName}).Return(FakeBackupListEmpty, nil)
+	osmock.On("GetSnapshotByID", FakeVolID).Return(&FakeSnapshotRes, nil)
 
-	// Init assert
 	assert := assert.New(t)
 
 	// Fake request
@@ -386,13 +1147,206 @@ func TestCreateSnapshot(t *testing.T) {
 	assert.NotNil(FakeSnapshotID, actualRes.Snapshot.SnapshotId)
 }
 
-// Test DeleteSnapshot
-func TestDeleteSnapshot(t *testing.T) {
+// Test CreateSnapshot with extra metadata
+func TestCreateSnapshotWithExtraMetadata(t *testing.T) {
+	fakeCs, osmock := fakeControllerServer()
 
-	// DeleteSnapshot(volumeID string) error
+	properties := map[string]string{
+		cinderCSIClusterIDKey:               FakeCluster,
+		sharedcsi.VolSnapshotNameKey:        FakeSnapshotName,
+		sharedcsi.VolSnapshotContentNameKey: FakeSnapshotContentName,
+		sharedcsi.VolSnapshotNamespaceKey:   FakeSnapshotNamespace,
+		openstack.SnapshotForceCreate:       "true",
+	}
+
+	osmock.On("CreateSnapshot", FakeSnapshotName, FakeVolID, properties).Return(&FakeSnapshotRes, nil)
+	osmock.On("ListSnapshots", map[string]string{"Name": FakeSnapshotName}).Return(FakeSnapshotListEmpty, "", nil)
+	osmock.On("WaitSnapshotReady", FakeSnapshotID).Return(FakeSnapshotRes.Status, nil)
+
+	assert := assert.New(t)
+
+	// Fake request
+	fakeReq := &csi.CreateSnapshotRequest{
+		Name:           FakeSnapshotName,
+		SourceVolumeId: FakeVolID,
+		Parameters: map[string]string{
+			sharedcsi.VolSnapshotNameKey:        FakeSnapshotName,
+			sharedcsi.VolSnapshotContentNameKey: FakeSnapshotContentName,
+			sharedcsi.VolSnapshotNamespaceKey:   FakeSnapshotNamespace,
+			openstack.SnapshotForceCreate:       "true",
+		},
+	}
+
+	// Invoke CreateSnapshot
+	actualRes, err := fakeCs.CreateSnapshot(FakeCtx, fakeReq)
+	if err != nil {
+		t.Errorf("failed to CreateSnapshot: %v", err)
+	}
+
+	// Assert
+	assert.Equal(FakeVolID, actualRes.Snapshot.SourceVolumeId)
+
+	assert.NotNil(FakeSnapshotID, actualRes.Snapshot.SnapshotId)
+}
+
+func TestCreateSnapshotWithAppendVolumeMetadata(t *testing.T) {
+	fakeCs, osmock := fakeControllerServer()
+
+	expectedProperties := map[string]string{
+		cinderCSIClusterIDKey:             "override",
+		sharedcsi.VolSnapshotNamespaceKey: FakeSnapshotNamespace,
+		"key1":                            "value1",
+		"key2":                            "value2",
+	}
+
+	osmock.On("CreateSnapshot", FakeSnapshotName, FakeVolID, expectedProperties).Return(&FakeSnapshotRes, nil)
+	osmock.On("ListSnapshots", map[string]string{"Name": FakeSnapshotName}).Return(FakeSnapshotListEmpty, "", nil)
+	osmock.On("WaitSnapshotReady", FakeSnapshotID).Return(FakeSnapshotRes.Status, nil)
+
+	fakeReq := &csi.CreateSnapshotRequest{
+		Name:           FakeSnapshotName,
+		SourceVolumeId: FakeVolID,
+		Parameters: map[string]string{
+			sharedcsi.VolSnapshotNamespaceKey: FakeSnapshotNamespace,
+			openstack.SnapshotAppendVolumeMetadata: `{
+  "key1": "value1",
+  "key2": "value2",
+  "csi.storage.k8s.io/volumesnapshot/namespace": "ignored",
+  "cinder.csi.openstack.org/cluster": "override"
+}`,
+		},
+	}
+
+	_, err := fakeCs.CreateSnapshot(FakeCtx, fakeReq)
+	if err != nil {
+		t.Errorf("failed to CreateSnapshot with appendVolumeMetadata: %v", err)
+	}
+}
+
+func TestCreateSnapshotBackupGetBackupByIDError(t *testing.T) {
+	fakeCs, osmock := fakeControllerServer()
+
+	backendErr := errors.New("backend lookup failed")
+	existingBackup := backups.Backup{
+		ID:   "existing-backup-id",
+		Name: FakeSnapshotName,
+	}
+
+	osmock.On("ListBackups", map[string]string{"Name": FakeSnapshotName}).Return([]backups.Backup{existingBackup}, nil)
+	osmock.On("GetBackupByID", existingBackup.ID).Return((*backups.Backup)(nil), backendErr)
+
+	fakeReq := &csi.CreateSnapshotRequest{
+		Name:           FakeSnapshotName,
+		SourceVolumeId: FakeVolID,
+		Parameters: map[string]string{
+			openstack.SnapshotType: "backup",
+		},
+	}
+
+	_, err := fakeCs.CreateSnapshot(FakeCtx, fakeReq)
+	if err == nil {
+		t.Fatal("expected CreateSnapshot to return an error")
+	}
+
+	statusErr, ok := status.FromError(err)
+	if !ok {
+		t.Fatalf("expected grpc status error, got %v", err)
+	}
+
+	assert.Equal(t, codes.Internal, statusErr.Code())
+	assert.Equal(t, "Failed to get backup by ID", statusErr.Message())
+}
+
+func TestCreateSnapshotBackupWithAppendVolumeMetadata(t *testing.T) {
+	fakeCs, osmock := fakeControllerServer()
+
+	expectedSnapshotProperties := map[string]string{
+		cinderCSIClusterIDKey: FakeCluster,
+		"key1":                "value1",
+		"key2":                "value2",
+	}
+
+	expectedBackupProperties := map[string]string{
+		cinderCSIClusterIDKey: FakeCluster,
+		"key1":                "value1",
+		"key2":                "value2",
+		"type":                "backup",
+	}
+
+	osmock.On("CreateSnapshot", FakeSnapshotName, FakeVolID, expectedSnapshotProperties).Return(&FakeSnapshotRes, nil)
+	osmock.On("ListSnapshots", map[string]string{"Name": FakeSnapshotName}).Return(FakeSnapshotListEmpty, "", nil)
+	osmock.On("WaitSnapshotReady", FakeSnapshotID).Return(FakeSnapshotRes.Status, nil)
 	osmock.On("DeleteSnapshot", FakeSnapshotID).Return(nil)
 
-	// Init assert
+	osmock.On("CreateBackup", FakeSnapshotName, FakeVolID, FakeSnapshotID, "", expectedBackupProperties).Return(&FakeBackupRes, nil)
+	osmock.On("ListBackups", map[string]string{"Name": FakeSnapshotName}).Return(FakeBackupListEmpty, nil)
+	osmock.On("WaitBackupReady", FakeBackupID).Return(FakeBackupRes.Status, nil)
+
+	fakeReq := &csi.CreateSnapshotRequest{
+		Name:           FakeSnapshotName,
+		SourceVolumeId: FakeVolID,
+		Parameters: map[string]string{
+			openstack.SnapshotType: "backup",
+			openstack.SnapshotAppendVolumeMetadata: `{
+  "key1": "value1",
+  "key2": "value2"
+}`,
+		},
+	}
+
+	_, err := fakeCs.CreateSnapshot(FakeCtx, fakeReq)
+	if err != nil {
+		t.Errorf("failed to CreateSnapshot backup with appendVolumeMetadata: %v", err)
+	}
+}
+
+// Test CreateSnapshot with snapshot type 'backup' and the incremental parameter
+func TestCreateSnapshotBackupWithIncremental(t *testing.T) {
+	fakeCs, osmock := fakeControllerServer()
+
+	expectedSnapshotProperties := map[string]string{
+		cinderCSIClusterIDKey: FakeCluster,
+	}
+
+	expectedBackupProperties := map[string]string{
+		cinderCSIClusterIDKey:         FakeCluster,
+		"type":                        "backup",
+		openstack.SnapshotIncremental: "true",
+	}
+
+	osmock.On("CreateSnapshot", FakeSnapshotName, FakeVolID, expectedSnapshotProperties).Return(&FakeSnapshotRes, nil)
+	osmock.On("ListSnapshots", map[string]string{"Name": FakeSnapshotName}).Return(FakeSnapshotListEmpty, "", nil)
+	osmock.On("WaitSnapshotReady", FakeSnapshotID).Return(FakeSnapshotRes.Status, nil)
+	osmock.On("DeleteSnapshot", FakeSnapshotID).Return(nil)
+
+	osmock.On("CreateBackup", FakeSnapshotName, FakeVolID, FakeSnapshotID, "", expectedBackupProperties).Return(&FakeBackupRes, nil)
+	osmock.On("ListBackups", map[string]string{"Name": FakeSnapshotName}).Return(FakeBackupListEmpty, nil)
+	osmock.On("WaitBackupReady", FakeBackupID).Return(FakeBackupRes.Status, nil)
+
+	fakeReq := &csi.CreateSnapshotRequest{
+		Name:           FakeSnapshotName,
+		SourceVolumeId: FakeVolID,
+		Parameters: map[string]string{
+			openstack.SnapshotType:        "backup",
+			openstack.SnapshotIncremental: "true",
+		},
+	}
+
+	_, err := fakeCs.CreateSnapshot(FakeCtx, fakeReq)
+	if err != nil {
+		t.Errorf("failed to CreateSnapshot backup with incremental: %v", err)
+	}
+
+	osmock.AssertCalled(t, "CreateBackup", FakeSnapshotName, FakeVolID, FakeSnapshotID, "", expectedBackupProperties)
+}
+
+// Test DeleteSnapshot
+func TestDeleteSnapshot(t *testing.T) {
+	fakeCs, osmock := fakeControllerServer()
+
+	osmock.On("GetBackupByID", FakeSnapshotID).Return((*backups.Backup)(nil), cpoerrors.ErrNotFound)
+	osmock.On("DeleteSnapshot", FakeSnapshotID).Return(nil)
+
 	assert := assert.New(t)
 
 	// Fake request
@@ -400,7 +1354,7 @@ func TestDeleteSnapshot(t *testing.T) {
 		SnapshotId: FakeSnapshotID,
 	}
 
-	// Expected Result
+	// Expected result
 	expectedRes := &csi.DeleteSnapshotResponse{}
 
 	// Invoke DeleteSnapshot
@@ -413,9 +1367,61 @@ func TestDeleteSnapshot(t *testing.T) {
 	assert.Equal(expectedRes, actualRes)
 }
 
+func TestDeleteSnapshotDeletesBackupWithoutDeletingSnapshot(t *testing.T) {
+	fakeCs, osmock := fakeControllerServer()
+
+	osmock.On("GetBackupByID", FakeSnapshotID).Return(&backups.Backup{ID: FakeSnapshotID}, nil)
+	osmock.On("DeleteBackup", FakeSnapshotID).Return(nil)
+
+	actualRes, err := fakeCs.DeleteSnapshot(FakeCtx, &csi.DeleteSnapshotRequest{SnapshotId: FakeSnapshotID})
+	if err != nil {
+		t.Fatalf("DeleteSnapshot returned an error: %v", err)
+	}
+
+	assert.Equal(t, &csi.DeleteSnapshotResponse{}, actualRes)
+	osmock.AssertNotCalled(t, "DeleteSnapshot", FakeSnapshotID)
+}
+
+func TestDeleteSnapshotIgnoresBackupNotFoundDuringDelete(t *testing.T) {
+	fakeCs, osmock := fakeControllerServer()
+
+	osmock.On("GetBackupByID", FakeSnapshotID).Return(&backups.Backup{ID: FakeSnapshotID}, nil)
+	osmock.On("DeleteBackup", FakeSnapshotID).Return(cpoerrors.ErrNotFound)
+
+	actualRes, err := fakeCs.DeleteSnapshot(FakeCtx, &csi.DeleteSnapshotRequest{SnapshotId: FakeSnapshotID})
+	if err != nil {
+		t.Fatalf("DeleteSnapshot returned an error: %v", err)
+	}
+
+	assert.Equal(t, &csi.DeleteSnapshotResponse{}, actualRes)
+	osmock.AssertNotCalled(t, "DeleteSnapshot", FakeSnapshotID)
+}
+
+func TestDeleteSnapshotReturnsErrorWhenBackupLookupFails(t *testing.T) {
+	fakeCs, osmock := fakeControllerServer()
+	lookupErr := errors.New("cinder backup service unavailable")
+
+	osmock.On("GetBackupByID", FakeSnapshotID).Return((*backups.Backup)(nil), lookupErr)
+	osmock.On("DeleteSnapshot", FakeSnapshotID).Maybe().Return(cpoerrors.ErrNotFound)
+
+	_, err := fakeCs.DeleteSnapshot(FakeCtx, &csi.DeleteSnapshotRequest{SnapshotId: FakeSnapshotID})
+	if err == nil {
+		t.Fatal("expected DeleteSnapshot to return an error")
+	}
+
+	statusErr, ok := status.FromError(err)
+	if !ok {
+		t.Fatalf("expected grpc status error, got %v", err)
+	}
+	assert.Equal(t, codes.Internal, statusErr.Code())
+	osmock.AssertNotCalled(t, "DeleteSnapshot", FakeSnapshotID)
+}
+
 func TestListSnapshots(t *testing.T) {
+	fakeCs, osmock := fakeControllerServer()
 
 	osmock.On("ListSnapshots", map[string]string{"Limit": "1", "Marker": FakeVolID, "Status": "available"}).Return(FakeSnapshotsRes, "", nil)
+
 	assert := assert.New(t)
 
 	fakeReq := &csi.ListSnapshotsRequest{MaxEntries: 1, StartingToken: FakeVolID}
@@ -430,15 +1436,18 @@ func TestListSnapshots(t *testing.T) {
 }
 
 func TestControllerExpandVolume(t *testing.T) {
+	fakeCs, osmock := fakeControllerServer()
 
+	fakeVolAvailable := &volumes.Volume{
+		ID:     FakeVolID,
+		Status: openstack.VolumeAvailableStatus,
+		Size:   FakeCapacityGiB,
+	}
+	osmock.On("GetVolume", FakeVolID).Return(fakeVolAvailable, nil)
 	tState := []string{"available", "in-use"}
-	// ExpandVolume(volumeID string, status string, size int)
 	osmock.On("ExpandVolume", FakeVolID, openstack.VolumeAvailableStatus, 5).Return(nil)
-
-	// WaitVolumeTargetStatus(volumeID string, tState []string) error
 	osmock.On("WaitVolumeTargetStatus", FakeVolID, tState).Return(nil)
 
-	// Init assert
 	assert := assert.New(t)
 
 	// Fake request
@@ -449,7 +1458,7 @@ func TestControllerExpandVolume(t *testing.T) {
 		},
 	}
 
-	// Expected Result
+	// Expected result
 	expectedRes := &csi.ControllerExpandVolumeResponse{
 		CapacityBytes:         5 * 1024 * 1024 * 1024,
 		NodeExpansionRequired: true,
@@ -463,15 +1472,13 @@ func TestControllerExpandVolume(t *testing.T) {
 
 	// Assert
 	assert.Equal(expectedRes, actualRes)
-
 }
 
 func TestValidateVolumeCapabilities(t *testing.T) {
+	fakeCs, osmock := fakeControllerServer()
 
-	// GetVolume(volumeID string)
-	osmock.On("GetVolume", FakeVolID).Return(FakeVol1)
+	osmock.On("GetVolume", FakeVolID).Return(&FakeVol1, nil)
 
-	// Init assert
 	assert := assert.New(t)
 
 	// fake req
@@ -511,18 +1518,414 @@ func TestValidateVolumeCapabilities(t *testing.T) {
 		},
 	}
 
-	expectedRes2 := &csi.ValidateVolumeCapabilitiesResponse{Message: "Requested Volume Capabilty not supported"}
+	expectedRes2 := &csi.ValidateVolumeCapabilitiesResponse{Message: "Requested Volume Capability not supported"}
 
-	// Invoke ValidateVolumeCapabilties
+	// Invoke ValidateVolumeCapabilities
 	actualRes, err := fakeCs.ValidateVolumeCapabilities(FakeCtx, fakereq)
-	actualRes2, err := fakeCs.ValidateVolumeCapabilities(FakeCtx, fakereq2)
-
 	if err != nil {
-		t.Errorf("failed to ValidateVolumeCapabilties: %v", err)
+		t.Errorf("failed to ValidateVolumeCapabilities: %v", err)
+	}
+
+	actualRes2, err := fakeCs.ValidateVolumeCapabilities(FakeCtx, fakereq2)
+	if err != nil {
+		t.Errorf("failed to ValidateVolumeCapabilities: %v", err)
 	}
 
 	// assert
 	assert.Equal(expectedRes, actualRes)
 	assert.Equal(expectedRes2, actualRes2)
+}
 
+func TestAppendVolumeMetadata(t *testing.T) {
+	assert := assert.New(t)
+
+	cases := []struct {
+		properties  map[string]string
+		metadataStr string
+		classType   string
+		name        string
+
+		expectedProperties    map[string]string
+		expectedErrStrPattern string
+	}{
+		{
+			properties:  map[string]string{},
+			metadataStr: `{"key1": "value1"}`,
+			classType:   "StorageClass",
+			name:        "vol1",
+
+			expectedProperties: map[string]string{
+				"key1": "value1",
+			},
+			expectedErrStrPattern: "",
+		},
+		{
+			properties:  map[string]string{},
+			metadataStr: "",
+			classType:   "StorageClass",
+			name:        "vol1",
+
+			expectedProperties:    map[string]string{},
+			expectedErrStrPattern: "",
+		},
+		{
+			properties: map[string]string{
+				"existingKey": "existingValue",
+			},
+			metadataStr: "",
+			classType:   "StorageClass",
+			name:        "vol1",
+
+			expectedProperties: map[string]string{
+				"existingKey": "existingValue",
+			},
+			expectedErrStrPattern: "",
+		},
+		{
+			properties:  map[string]string{},
+			metadataStr: "invalid metadata",
+			classType:   "StorageClass",
+			name:        "vol1",
+
+			expectedProperties:    nil,
+			expectedErrStrPattern: `invalid appendVolumeMetadata "invalid metadata" in StorageClass parameters, must be a string of a valid JSON object consisting of key-value pairs of type string`,
+		},
+		{
+			properties: map[string]string{
+				"existingKey":         "existingValue",
+				cinderCSIClusterIDKey: "origin",
+			},
+			metadataStr: `{"key1": "value1", "existingKey": "newValue", "cinder.csi.openstack.org/cluster": "override"}`,
+			classType:   "StorageClass",
+			name:        "vol1",
+
+			expectedProperties: map[string]string{
+				"existingKey":         "existingValue",
+				"key1":                "value1",
+				cinderCSIClusterIDKey: "override",
+			},
+			expectedErrStrPattern: "",
+		},
+	}
+
+	for _, c := range cases {
+		properties, err := appendVolumeMetadata(c.properties, c.metadataStr, c.classType, c.name)
+		assert.Equal(c.expectedProperties, properties)
+		if c.expectedErrStrPattern == "" {
+			assert.NoError(err)
+		} else {
+			assert.ErrorContains(err, c.expectedErrStrPattern)
+		}
+	}
+}
+
+// --- Direct mode tests ---
+
+// mockConnectorPropertiesGetter is a testify mock for ConnectorPropertiesGetter.
+type mockConnectorPropertiesGetter struct {
+	mock.Mock
+}
+
+func (m *mockConnectorPropertiesGetter) GetConnectorProperties(ctx context.Context, nodeID string) (map[string]any, error) {
+	args := m.Called(ctx, nodeID)
+	if props := args.Get(0); props != nil {
+		return props.(map[string]any), args.Error(1)
+	}
+	return nil, args.Error(1)
+}
+
+func fakeDirectControllerServer() (*controllerServer, *openstack.OpenStackMock, *mockConnectorPropertiesGetter) {
+	osmock := new(openstack.OpenStackMock)
+	connPropsMock := new(mockConnectorPropertiesGetter)
+
+	d := NewDriver(&DriverOpts{Endpoint: FakeEndpoint, ClusterID: FakeCluster, WithTopology: true, AttachMode: "direct"})
+
+	cs := NewControllerServer(d, map[string]openstack.IOpenStack{
+		"": osmock,
+	}, connPropsMock)
+	return cs, osmock, connPropsMock
+}
+
+var FakeConnectorProperties = map[string]any{
+	"initiator": "iqn.2025-01.com.example:node1",
+	"host":      "node1",
+	"multipath": false,
+}
+
+var FakeConnectionInfoMap = map[string]any{
+	"driver_volume_type": "iscsi",
+	"data": map[string]any{
+		"target_iqn":    "iqn.2025-01.com.example:storage",
+		"target_portal": "10.0.0.1:3260",
+	},
+}
+
+// TestControllerPublishVolumeDirectMode verifies that in direct mode:
+// 1. Connector properties are read from the node annotation
+// 2. AttachmentCreate is called with those properties
+// 3. AttachmentID and ConnectionInfo JSON are returned in PublishContext
+func TestControllerPublishVolumeDirectMode(t *testing.T) {
+	fakeCs, osmock, connPropsMock := fakeDirectControllerServer()
+
+	osmock.On("GetVolume", FakeVolID).Return(&FakeVol, nil)
+	connPropsMock.On("GetConnectorProperties", mock.Anything, FakeNodeID).Return(FakeConnectorProperties, nil)
+	osmock.On("AttachmentCreate", FakeVolID, FakeNodeID, FakeConnectorProperties).Return(FakeAttachmentID, FakeConnectionInfoMap, nil)
+
+	assert := assert.New(t)
+
+	fakeReq := &csi.ControllerPublishVolumeRequest{
+		VolumeId: FakeVolID,
+		NodeId:   FakeNodeID,
+		VolumeCapability: &csi.VolumeCapability{
+			AccessType: &csi.VolumeCapability_Mount{
+				Mount: &csi.VolumeCapability_MountVolume{},
+			},
+		},
+		Readonly: false,
+	}
+
+	actualRes, err := fakeCs.ControllerPublishVolume(FakeCtx, fakeReq)
+	assert.NoError(err)
+	assert.NotNil(actualRes)
+
+	// Verify AttachmentID is in PublishContext
+	assert.Equal(FakeAttachmentID, actualRes.PublishContext["AttachmentID"])
+
+	// Verify ConnectionInfo is in PublishContext
+	connInfoJSON := actualRes.PublishContext["ConnectionInfo"]
+	assert.NotEmpty(connInfoJSON)
+
+	// Verify the JSON round-trips correctly
+	var parsed map[string]any
+	err = json.Unmarshal([]byte(connInfoJSON), &parsed)
+	assert.NoError(err)
+	assert.Equal("iscsi", parsed["driver_volume_type"])
+
+	// Verify the right calls were made
+	connPropsMock.AssertCalled(t, "GetConnectorProperties", mock.Anything, FakeNodeID)
+	osmock.AssertCalled(t, "AttachmentCreate", FakeVolID, FakeNodeID, FakeConnectorProperties)
+
+	// Verify Nova calls were NOT made
+	osmock.AssertNotCalled(t, "AttachVolume")
+	osmock.AssertNotCalled(t, "GetInstanceByID")
+}
+
+// TestControllerPublishVolumeDirectModeConnPropsError verifies that
+// ControllerPublishVolume fails when connector properties are unavailable.
+func TestControllerPublishVolumeDirectModeConnPropsError(t *testing.T) {
+	fakeCs, osmock, connPropsMock := fakeDirectControllerServer()
+
+	osmock.On("GetVolume", FakeVolID).Return(&FakeVol, nil)
+	connPropsMock.On("GetConnectorProperties", mock.Anything, FakeNodeID).Return(nil, fmt.Errorf("node not found"))
+
+	fakeReq := &csi.ControllerPublishVolumeRequest{
+		VolumeId: FakeVolID,
+		NodeId:   FakeNodeID,
+		VolumeCapability: &csi.VolumeCapability{
+			AccessType: &csi.VolumeCapability_Mount{
+				Mount: &csi.VolumeCapability_MountVolume{},
+			},
+		},
+	}
+
+	_, err := fakeCs.ControllerPublishVolume(FakeCtx, fakeReq)
+	assert.Error(t, err)
+	st, ok := status.FromError(err)
+	assert.True(t, ok)
+	assert.Equal(t, codes.Internal, st.Code())
+}
+
+// TestControllerPublishVolumeDirectModeIdempotentReuse verifies that when
+// the volume already has an in-use attachment for this node (e.g. a
+// retried ControllerPublishVolume call), the existing attachment's
+// connection info is reused via AttachmentGet instead of creating a new
+// attachment.
+func TestControllerPublishVolumeDirectModeIdempotentReuse(t *testing.T) {
+	fakeCs, osmock, connPropsMock := fakeDirectControllerServer()
+
+	fakeVolInUse := &volumes.Volume{
+		ID:     FakeVolID,
+		Name:   FakeVolName,
+		Status: openstack.VolumeInUseStatus,
+		Attachments: []volumes.Attachment{
+			{
+				ServerID:     FakeNodeID,
+				AttachmentID: FakeAttachmentID,
+			},
+		},
+	}
+	osmock.On("GetVolume", FakeVolID).Return(fakeVolInUse, nil)
+	osmock.On("AttachmentGet", FakeAttachmentID).Return(FakeConnectionInfoMap, nil)
+
+	assert := assert.New(t)
+
+	fakeReq := &csi.ControllerPublishVolumeRequest{
+		VolumeId: FakeVolID,
+		NodeId:   FakeNodeID,
+		VolumeCapability: &csi.VolumeCapability{
+			AccessType: &csi.VolumeCapability_Mount{
+				Mount: &csi.VolumeCapability_MountVolume{},
+			},
+		},
+	}
+
+	actualRes, err := fakeCs.ControllerPublishVolume(FakeCtx, fakeReq)
+	assert.NoError(err)
+	assert.NotNil(actualRes)
+	assert.Equal(FakeAttachmentID, actualRes.PublishContext["AttachmentID"])
+
+	var parsed map[string]any
+	err = json.Unmarshal([]byte(actualRes.PublishContext["ConnectionInfo"]), &parsed)
+	assert.NoError(err)
+	assert.Equal("iscsi", parsed["driver_volume_type"])
+
+	osmock.AssertCalled(t, "AttachmentGet", FakeAttachmentID)
+
+	// Verify no new attachment was created and the stale-attachment
+	// cleanup / connector properties lookup were skipped.
+	osmock.AssertNotCalled(t, "AttachmentCreate", mock.Anything, mock.Anything, mock.Anything)
+	osmock.AssertNotCalled(t, "AttachmentDelete", mock.Anything)
+	connPropsMock.AssertNotCalled(t, "GetConnectorProperties", mock.Anything, mock.Anything)
+}
+
+// TestControllerPublishVolumeDirectModeMultiattachPreservesOtherNode
+// verifies that for a multiattach volume, an existing attachment
+// belonging to a *different* node is left untouched (not deleted as
+// stale) while a new attachment is created for the requesting node.
+func TestControllerPublishVolumeDirectModeMultiattachPreservesOtherNode(t *testing.T) {
+	fakeCs, osmock, connPropsMock := fakeDirectControllerServer()
+
+	const otherAttachmentID = "other-attachment-id"
+	const otherNodeID = "other-node-id"
+
+	fakeVolMultiattach := &volumes.Volume{
+		ID:          FakeVolID,
+		Name:        FakeVolName,
+		Status:      openstack.VolumeInUseStatus,
+		Multiattach: true,
+		Attachments: []volumes.Attachment{
+			{
+				ServerID:     otherNodeID,
+				AttachmentID: otherAttachmentID,
+			},
+		},
+	}
+	osmock.On("GetVolume", FakeVolID).Return(fakeVolMultiattach, nil)
+	connPropsMock.On("GetConnectorProperties", mock.Anything, FakeNodeID).Return(FakeConnectorProperties, nil)
+	osmock.On("AttachmentCreate", FakeVolID, FakeNodeID, FakeConnectorProperties).Return(FakeAttachmentID, FakeConnectionInfoMap, nil)
+
+	assert := assert.New(t)
+
+	fakeReq := &csi.ControllerPublishVolumeRequest{
+		VolumeId: FakeVolID,
+		NodeId:   FakeNodeID,
+		VolumeCapability: &csi.VolumeCapability{
+			AccessType: &csi.VolumeCapability_Mount{
+				Mount: &csi.VolumeCapability_MountVolume{},
+			},
+		},
+	}
+
+	actualRes, err := fakeCs.ControllerPublishVolume(FakeCtx, fakeReq)
+	assert.NoError(err)
+	assert.NotNil(actualRes)
+	assert.Equal(FakeAttachmentID, actualRes.PublishContext["AttachmentID"])
+
+	osmock.AssertCalled(t, "AttachmentCreate", FakeVolID, FakeNodeID, FakeConnectorProperties)
+
+	// The other node's attachment must NOT be deleted.
+	osmock.AssertNotCalled(t, "AttachmentDelete", otherAttachmentID)
+}
+
+// TestControllerUnpublishVolumeDirectMode verifies that in direct mode:
+// 1. The volume's attachments are looked up via GetVolume
+// 2. AttachmentDelete is called with the matching attachment ID
+// 3. No Nova detach calls or connector properties lookups are made
+func TestControllerUnpublishVolumeDirectMode(t *testing.T) {
+	fakeCs, osmock, _ := fakeDirectControllerServer()
+
+	fakeVolWithAttachment := &volumes.Volume{
+		ID:   FakeVolID,
+		Name: FakeVolName,
+		Attachments: []volumes.Attachment{
+			{
+				ServerID:     FakeNodeID,
+				AttachmentID: FakeAttachmentID,
+			},
+		},
+	}
+	osmock.On("GetVolume", FakeVolID).Return(fakeVolWithAttachment, nil)
+	osmock.On("AttachmentDelete", FakeAttachmentID).Return(nil)
+	osmock.On("WaitVolumeTargetStatus", FakeVolID, []string{"available", "in-use"}).Return(nil)
+
+	assert := assert.New(t)
+
+	fakeReq := &csi.ControllerUnpublishVolumeRequest{
+		VolumeId: FakeVolID,
+		NodeId:   FakeNodeID,
+	}
+
+	actualRes, err := fakeCs.ControllerUnpublishVolume(FakeCtx, fakeReq)
+	assert.NoError(err)
+	assert.Equal(&csi.ControllerUnpublishVolumeResponse{}, actualRes)
+
+	osmock.AssertCalled(t, "GetVolume", FakeVolID)
+	osmock.AssertCalled(t, "AttachmentDelete", FakeAttachmentID)
+
+	// Verify Nova calls were NOT made
+	osmock.AssertNotCalled(t, "DetachVolume")
+	osmock.AssertNotCalled(t, "GetInstanceByID")
+}
+
+// TestControllerUnpublishVolumeDirectModeVolumeNotFound verifies that
+// ControllerUnpublishVolume returns success when the volume is not found
+// (idempotent : volume may already be deleted).
+func TestControllerUnpublishVolumeDirectModeVolumeNotFound(t *testing.T) {
+	fakeCs, osmock, _ := fakeDirectControllerServer()
+
+	osmock.On("GetVolume", FakeVolID).Return(nil, cpoerrors.ErrNotFound)
+
+	assert := assert.New(t)
+
+	fakeReq := &csi.ControllerUnpublishVolumeRequest{
+		VolumeId: FakeVolID,
+		NodeId:   FakeNodeID,
+	}
+
+	actualRes, err := fakeCs.ControllerUnpublishVolume(FakeCtx, fakeReq)
+	assert.NoError(err)
+	assert.Equal(&csi.ControllerUnpublishVolumeResponse{}, actualRes)
+}
+
+// TestControllerUnpublishVolumeDirectModeNoMatchingAttachment verifies that
+// ControllerUnpublishVolume returns success when the volume exists but has
+// no attachment matching the node ID (already detached).
+func TestControllerUnpublishVolumeDirectModeNoMatchingAttachment(t *testing.T) {
+	fakeCs, osmock, _ := fakeDirectControllerServer()
+
+	fakeVolNoMatch := &volumes.Volume{
+		ID:   FakeVolID,
+		Name: FakeVolName,
+		Attachments: []volumes.Attachment{
+			{
+				ServerID:     "some-other-node",
+				AttachmentID: "other-attachment",
+			},
+		},
+	}
+	osmock.On("GetVolume", FakeVolID).Return(fakeVolNoMatch, nil)
+
+	assert := assert.New(t)
+
+	fakeReq := &csi.ControllerUnpublishVolumeRequest{
+		VolumeId: FakeVolID,
+		NodeId:   FakeNodeID,
+	}
+
+	actualRes, err := fakeCs.ControllerUnpublishVolume(FakeCtx, fakeReq)
+	assert.NoError(err)
+	assert.Equal(&csi.ControllerUnpublishVolumeResponse{}, actualRes)
+
+	// AttachmentDelete should NOT have been called
+	osmock.AssertNotCalled(t, "AttachmentDelete", mock.Anything)
 }

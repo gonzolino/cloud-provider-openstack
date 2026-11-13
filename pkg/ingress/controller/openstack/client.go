@@ -19,8 +19,8 @@ package openstack
 import (
 	"fmt"
 
-	"github.com/gophercloud/gophercloud"
-	"github.com/gophercloud/gophercloud/openstack"
+	"github.com/gophercloud/gophercloud/v2"
+	"github.com/gophercloud/gophercloud/v2/openstack"
 	log "github.com/sirupsen/logrus"
 
 	"k8s.io/cloud-provider-openstack/pkg/client"
@@ -73,7 +73,7 @@ func NewOpenStack(cfg config.Config) (*OpenStack, error) {
 	var barbican *gophercloud.ServiceClient
 	barbican, err = openstack.NewKeyManagerV1(provider, epOpts)
 	if err != nil {
-		log.Warn("Barbican not suppported.")
+		log.Warn("Barbican not supported.")
 		barbican = nil
 	}
 
